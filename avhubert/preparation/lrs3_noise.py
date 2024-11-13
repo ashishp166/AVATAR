@@ -31,7 +31,7 @@ def main():
     for output_tsv in output_tsvs:
         os.makedirs(os.path.dirname(output_tsv), exist_ok=True)
 
-    print(f"Generating babble noise -> {output_tsvs}")
+    print(f"Generating babble noise -> {output_tsvs}") # TODO: Try different noises to outside of babble noise like WavLM
     num_samples = 30
     sample_rate = 16_000
     min_len = 15*sample_rate
@@ -42,6 +42,13 @@ def main():
     wav_fns = [wav_fns[i][0] for i in indexes]
     wav_data = mix_audio(wav_fns)
     wavfile.write(output_wav, sample_rate, wav_data)
+    # TODO: Call SPARC here and then get get the ema output
+    from sparc import load_model
+    coder = load_model("en", device= "cpu")     # For using CPU
+    # coder = load_model("en", device= "cuda:0")  # For using GPU
+    artiulatory_data = coder.encode(output_wav)
+    artiulatory_data = artiulatory_data['ema'] # TODO: Figure out dimension and also format of data need to pass in
+    
     for output_tsv in output_tsvs:
         with open(output_tsv, 'w') as fo:
             fo.write(os.path.abspath(output_wav)+'\n')
