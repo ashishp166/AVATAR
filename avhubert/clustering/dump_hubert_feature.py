@@ -60,7 +60,7 @@ class HubertFeatureReader(object):
                 feats = np.concatenate([feats, res], axis=0)
             feats = feats.reshape((-1, stack_order, feat_dim)).reshape(-1, stack_order*feat_dim)
             return feats
-        video_fn, audio_fn = mix_name
+        video_fn, audio_fn, articulatory_fn = mix_name # have to update mix_name to include articulatory_fn
         video_feats = self.load_image(video_fn)
 
         audio_fn = audio_fn.split(':')[0]
@@ -74,7 +74,12 @@ class HubertFeatureReader(object):
             audio_feats = np.concatenate([audio_feats, np.zeros([-diff, audio_feats.shape[-1]], dtype=audio_feats.dtype)])
         elif diff > 0:
             audio_feats = audio_feats[:-diff]
-        return video_feats, audio_feats
+        
+        # Have to figure out if this is correct, plus how to actually do this
+        articulatory_fn = articulatory_fn.split(':')[0]
+        articulatory_feats = self.load_articulatory(articulatory_fn)
+
+        return video_feats, audio_feats, articulatory_feats
 
     def load_image(self, audio_name):
         feats = self.custom_utils.load_video(audio_name)
@@ -83,14 +88,16 @@ class HubertFeatureReader(object):
         return feats
 
     def get_feats(self, path, ref_len=None):
-        video_feats, audio_feats = self.load_feature(path, ref_len)
+        video_feats, audio_feats, articulatory_feats = self.load_feature(path, ref_len)
         with torch.no_grad():
             audio_feats, video_feats = torch.from_numpy(audio_feats.astype(np.float32)).cuda(), torch.from_numpy(video_feats.astype(np.float32)).cuda()
             if self.task.cfg.normalize:
                 audio_feats = F.layer_norm(audio_feats, audio_feats.shape[1:])
+                # TODO: Might have to normalize articulatory_feats
             video_feats = video_feats.unsqueeze(dim=0).permute((0, 4, 1, 2, 3)).contiguous()
             audio_feats = audio_feats.unsqueeze(dim=0).transpose(1, 2)
-            source = {'audio': audio_feats, 'video': video_feats}
+            artiulatory_feats = artiulatory_feats.unsqueeze(dim=0).transpose(1, 2) # TODO: figure out how to do this
+            source = {'audio': audio_feats, 'video': video_feats, 'articulatory': articulatory_feats}
             if self.layer == 0:
                 ret_conv, output_layer = True, None
             else:
