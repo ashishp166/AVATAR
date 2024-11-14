@@ -48,7 +48,7 @@ def main():
     # coder = load_model("en", device= "cuda:0")  # For using GPU
     artiulatory_data = coder.encode(output_wav)
     artiulatory_data = artiulatory_data['ema'] # TODO: Figure out dimension and also format of data need to pass in
-    
+    print(artiulatory_data.shape)
     for output_tsv in output_tsvs:
         with open(output_tsv, 'w') as fo:
             fo.write(os.path.abspath(output_wav)+'\n')

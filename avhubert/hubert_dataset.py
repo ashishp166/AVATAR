@@ -35,6 +35,48 @@ else:
 
 logger = logging.getLogger(__name__)
 
+# AVATAR
+def load_audio_visual_articulatory(manifest_path, max_keep, min_keep, frame_rate, label_paths, label_rates, tol=0.1):
+    def is_audio_label_aligned(audio_dur, label_durs):
+        return all([abs(audio_dur - label_dur)<tol for label_dur in label_durs])
+
+    n_long, n_short, n_unaligned = 0, 0, 0
+    names, inds, sizes = [], [], []
+    dur_from_label_list = []
+    is_seq_label = any([x==-1 for x in label_rates])
+    for label_path, label_rate in zip(label_paths, label_rates):
+        label_lengths = [len(line.rstrip().split())/label_rate for line in open(label_path).readlines()]
+        dur_from_label_list.append(label_lengths)
+    dur_from_label_list = list(zip(*dur_from_label_list))
+
+    with open(manifest_path) as f:
+        root = f.readline().strip()
+        for ind, line in enumerate(f):
+            items = line.strip().split("\t")
+            sz = int(items[-2])
+            if min_keep is not None and sz < min_keep:
+                n_short += 1
+            elif max_keep is not None and sz > max_keep:
+                n_long += 1
+            elif (not is_seq_label) and (not is_audio_label_aligned(sz/frame_rate, dur_from_label_list[ind])):
+                n_unaligned += 1
+            else:
+                video_path = items[1]
+                audio_path = items[2]
+                articulatory_path = items[3]
+                audio_id = items[0]
+                names.append((video_path, audio_path+':'+audio_id, articulatory_path))
+                inds.append(ind)
+                sizes.append(sz)
+    tot = ind + 1
+    logger.info(
+        (
+            f"max_keep={max_keep}, min_keep={min_keep}, "
+            f"loaded {len(names)}, skipped {n_short} short and {n_long} long and {n_unaligned} unaligned, "
+            f"longest-loaded={max(sizes)}, shortest-loaded={min(sizes)}"
+        )
+    )
+    return root, names, inds, tot, sizes
 
 def load_audio_visual(manifest_path, max_keep, min_keep, frame_rate, label_paths, label_rates, tol=0.1):
     def is_audio_label_aligned(audio_dur, label_durs):
@@ -167,7 +209,8 @@ class AVHubertDataset(FairseqDataset):
             noise_fn=None,
             noise_prob=0,
             noise_snr=0,
-            noise_num=1
+            noise_num=1,
+            articulatory_dim: int=12  # AVATAR: New parameter for articulatory feature dimension
     ):
         self.label_rates = (
             [label_rates for _ in range(len(label_paths))]
@@ -175,7 +218,12 @@ class AVHubertDataset(FairseqDataset):
             else label_rates
         )
         self.modalities = set(modalities)
-        self.audio_root, self.names, inds, tot, self.sizes = load_audio_visual(manifest_path, max_keep_sample_size, min_keep_sample_size, frame_rate=sample_rate, label_paths=label_paths, label_rates=self.label_rates)
+        # self.audio_root, self.names, inds, tot, self.sizes = load_audio_visual(manifest_path, max_keep_sample_size, min_keep_sample_size, frame_rate=sample_rate, label_paths=label_paths, label_rates=self.label_rates)
+        self.audio_root, self.names, inds, tot, self.sizes = load_audio_visual_articulatory(
+            manifest_path, max_keep_sample_size, min_keep_sample_size, 
+            frame_rate=sample_rate, label_paths=label_paths, 
+            label_rates=self.label_rates
+        ) # AVATAR: Updated so that also takes in articulatory
         self.sample_rate = sample_rate
         self.stack_order_audio = stack_order_audio
         self.shuffle = shuffle
@@ -189,6 +237,7 @@ class AVHubertDataset(FairseqDataset):
         self.store_labels = store_labels
         self.is_s2s = is_s2s
         self.noise_wav, self.noise_prob, self.noise_snr, self.noise_num = [ln.strip() for ln in open(noise_fn).readlines()] if noise_fn is not None else [], noise_prob, noise_snr, noise_num
+        self.articulatory_dim = articulatory_dim # AVATAR
 
         assert self.single_target == (self.label_rates[0] == -1), f"single target should be equivalent to sequence label (label_rate==-1)"
         if store_labels:
@@ -252,9 +301,11 @@ class AVHubertDataset(FairseqDataset):
 
     def load_feature(self, mix_name):
         """
-        Load image and audio feature
+        Load image, audio, and articulatory features
         Returns:
-        video_feats: numpy.ndarray of shape [T, H, W, 1], audio_feats: numpy.ndarray of shape [T, F]
+        video_feats: numpy.ndarray of shape [T, H, W, 1]
+        audio_feats: numpy.ndarray of shape [T, F]
+        articulatory_feats: numpy.ndarray of shape [T, F_1] where F_1 is currently 12 #AVATAR
         """
         def stacker(feats, stack_order):
             """
@@ -272,7 +323,7 @@ class AVHubertDataset(FairseqDataset):
                 feats = np.concatenate([feats, res], axis=0)
             feats = feats.reshape((-1, stack_order, feat_dim)).reshape(-1, stack_order*feat_dim)
             return feats
-        video_fn, audio_fn = mix_name
+        video_fn, audio_fn, articulatory_fn = mix_name # AVATAR
         if 'video' in self.modalities:
             video_feats = self.load_video(video_fn) # [T, H, W, 1]
         else:
@@ -287,13 +338,27 @@ class AVHubertDataset(FairseqDataset):
             audio_feats = stacker(audio_feats, self.stack_order_audio) # [T/stack_order_audio, F*stack_order_audio]
         else:
             audio_feats = None
-        if audio_feats is not None and video_feats is not None:
+        
+        if 'articulatory' in self.modalities:
+            articulatory_feats = np.load(os.path.join(self.audio_root, articulatory_fn))
+            assert articulatory_feats.shape[1] == self.articulatory_dim, \
+                f"Expected articulatory features of dimension {self.articulatory_dim}, got {articulatory_feats.shape[1]}"
+        else:
+            articulatory_feats = None
+
+        if audio_feats is not None and video_feats is not None and articulatory_feats is not None:
             diff = len(audio_feats) - len(video_feats)
             if diff < 0:
                 audio_feats = np.concatenate([audio_feats, np.zeros([-diff, audio_feats.shape[-1]], dtype=audio_feats.dtype)])
             elif diff > 0:
                 audio_feats = audio_feats[:-diff]
-        return video_feats, audio_feats
+            diff2 = len(articulatory_feats) - len(video_feats)
+            if diff2 < 0:
+                audio_feats = np.concatenate([articulatory_feats, np.zeros([-diff2, articulatory_feats.shape[-1]], dtype=articulatory_feats.dtype)])
+            elif diff2 > 0:
+                articulatory_feats = articulatory_feats[:-diff2]
+            
+        return video_feats, audio_feats, articulatory_fn # AVATAR
 
     def load_video(self, audio_name):
         feats = custom_utils.load_video(os.path.join(self.audio_root, audio_name))
@@ -346,14 +411,28 @@ class AVHubertDataset(FairseqDataset):
         return mixed
 
     def __getitem__(self, index):
-        video_feats, audio_feats = self.load_feature(self.names[index])
-        audio_feats, video_feats = torch.from_numpy(audio_feats.astype(np.float32)) if audio_feats is not None else None, torch.from_numpy(video_feats.astype(np.float32)) if video_feats is not None else None
-        if self.normalize and 'audio' in self.modalities:
-            with torch.no_grad():
-                audio_feats = F.layer_norm(audio_feats, audio_feats.shape[1:])
+        video_feats, audio_feats, articulatory_feats = self.load_feature(self.names[index])
+        audio_feats = torch.from_numpy(audio_feats.astype(np.float32)) if audio_feats is not None else None
+        video_feats = torch.from_numpy(video_feats.astype(np.float32)) if video_feats is not None else None
+        articulatory_feats = torch.from_numpy(articulatory_feats.astype(np.float32)) if articulatory_feats is not None else None # AVATAR
+
+        if self.normalize:
+            if 'audio' in self.modalities:
+                with torch.no_grad():
+                    audio_feats = F.layer_norm(audio_feats, audio_feats.shape[1:])
+            if 'articulatory' in self.modalities:  # AVATAR
+                with torch.no_grad():
+                    articulatory_feats = F.layer_norm(articulatory_feats, articulatory_feats.shape[1:])
         labels = self.get_labels(index)
         fid = self.names[index][1].split(':')[1]
-        return {"id": index, 'fid': fid, "video_source": video_feats, 'audio_source': audio_feats, "label_list": labels}
+        return {
+            "id": index, 
+            'fid': fid, 
+            "video_source": video_feats, 
+            'audio_source': audio_feats, 
+            'articulatory_source': articulatory_feats, # AVATAR
+            "label_list": labels
+        }
 
     def __len__(self):
         return len(self.sizes)
@@ -379,12 +458,17 @@ class AVHubertDataset(FairseqDataset):
             return {}
 
         audio_source, video_source = [s["audio_source"] for s in samples], [s["video_source"] for s in samples]
+        articulatory_source = [s["articulatory_source"] for s in samples]  # AVATAR
         if audio_source[0] is None:
             audio_source = None
         if video_source[0] is None:
             video_source = None
+        if articulatory_source[0] is None:  # AVATAR
+            articulatory_source = None
         if audio_source is not None:
             audio_sizes = [len(s) for s in audio_source]
+        elif articulatory_source is not None:  # AVATAR
+            audio_sizes = [len(s) for s in articulatory_source]
         else:
             audio_sizes = [len(s) for s in video_source]
         if self.pad_audio:
@@ -399,6 +483,12 @@ class AVHubertDataset(FairseqDataset):
             collated_videos, padding_mask, audio_starts = self.collater_audio(video_source, audio_size, audio_starts)
         else:
             collated_videos = None
+        if articulatory_source is not None:  # AVATAR
+            collated_articulatory, padding_mask, audio_starts = self.collater_audio(
+                articulatory_source, audio_size, audio_starts
+            )
+        else:
+            collated_articulatory = None
         targets_by_label = [
             [s["label_list"][i] for s in samples]
             for i in range(self.num_labels)
@@ -406,7 +496,12 @@ class AVHubertDataset(FairseqDataset):
         targets_list, lengths_list, ntokens_list = self.collater_label(
             targets_by_label, audio_size, audio_starts
         )
-        source = {"audio": collated_audios, "video": collated_videos}
+        source = {
+            "audio": collated_audios, 
+            "video": collated_videos,
+            "collated_articulatory": collated_articulatory # AVATAR
+        }
+
         net_input = {"source": source, "padding_mask": padding_mask}
         batch = {
             "id": torch.LongTensor([s["id"] for s in samples]),

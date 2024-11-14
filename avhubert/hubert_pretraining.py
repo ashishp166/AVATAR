@@ -156,7 +156,17 @@ class AVHubertPretrainingConfig(FairseqDataclass):
     noise_snr: Optional[str] = field(default='0', metadata={'help': 'noise SNR in audio'})
     noise_num: int = field(default=1, metadata={'help': 'number of noise wav files to mix'})
     fine_tuning: bool = field(default=False, metadata={"help": "set to true if fine-tuning AV-Hubert"})
-
+    articulatory_features: bool = field(  # AVATAR
+        default=False, metadata={"help": "Whether to use articulatory features"}
+    )
+    articulatory_dim: int = field(  # AVATAR
+        default=12, 
+        metadata={"help": "Dimension of articulatory feature vectors"}
+    )
+    articulatory_rate: int = field( # AVATAR
+        default=100,
+        metadata={"help": "Articulatory feature frame rate"}
+    )
 @register_task("av_hubert_pretraining", dataclass=AVHubertPretrainingConfig)
 class AVHubertPretrainingTask(FairseqTask):
 
@@ -268,7 +278,9 @@ class AVHubertPretrainingTask(FairseqTask):
             noise_fn=noise_fn,
             noise_prob=self.cfg.noise_prob,
             noise_snr=noise_snr,
-            noise_num=noise_num
+            noise_num=noise_num,
+            articulatory_dim=self.cfg.articulatory_dim, # AVATAR
+            modalities=self.cfg.modalities + (["articulatory"] if self.cfg.articulatory_features else []), # AVATAR
         )
 
     def max_positions(self) -> Tuple[int, int]:

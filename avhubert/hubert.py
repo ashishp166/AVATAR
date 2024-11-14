@@ -24,6 +24,7 @@ from fairseq.models.wav2vec.wav2vec2 import (
 )
 from fairseq.modules import GradMultiply, LayerNorm
 from copy import deepcopy
+from fairseq.modules import LayerNorm # AVATAR
 
 DBG=True if len(sys.argv) == 1 else False
 
@@ -313,6 +314,7 @@ class AVHubertConfig(FairseqDataclass):
         metadata={"help": "share decoder input and output embeddings"},
     )
     no_scale_embedding: bool = field(default=True, metadata={'help': 'scale embedding'})
+    articulatory_feat_dim: int = field(default=12, metadata={'help': 'articulatory feature dim'}) # AVATAR
 
 class SubModel(nn.Module):
     def __init__(self, resnet=None, input_dim=None, cfg=None):
@@ -350,12 +352,12 @@ class AVHubertModel(BaseFairseqModel):
         resnet = ResEncoder(relu_type=cfg.resnet_relu_type, weights=cfg.resnet_weights)
         self.feature_extractor_audio = SubModel(resnet=None, input_dim=cfg.audio_feat_dim, cfg=sub_cfg)
         self.feature_extractor_video = SubModel(resnet=resnet, input_dim=resnet.backend_out, cfg=sub_cfg)
-        self.feature_extractor_articulatory = SubModel(resnet=None, input_dim=cfg.articulatory_feat_dim, cfg=sub_cfg)
+        self.feature_extractor_articulatory = SubModel(resnet=None, input_dim=cfg.articulatory_feat_dim, cfg=sub_cfg) # AVATAR
         self.modality_dropout, self.audio_dropout = cfg.modality_dropout, cfg.audio_dropout
         self.modality_fuse = cfg.modality_fuse
         self.encoder_embed_dim = cfg.encoder_embed_dim
         if self.modality_fuse == 'concat':
-            self.embed = cfg.encoder_embed_dim * 3 # audio, video, articulatory
+            self.embed = cfg.encoder_embed_dim * 3 # AVATAR: audio, video, articulatory
         elif self.modality_fuse == 'add':
             self.embed = cfg.encoder_embed_dim
         self.post_extract_proj = (
@@ -610,7 +612,7 @@ class AVHubertModel(BaseFairseqModel):
 
         features_audio = self.forward_features(src_audio, modality='audio') # features: [B, F, T]
         features_video = self.forward_features(src_video, modality='video')
-        features_articulatory = self.forward_features(src_articulatory, modality='articulatory')
+        features_articulatory = self.forward_features(src_articulatory, modality='articulatory') # AVATAR
         modality_drop_prob, audio_drop_prob = np.random.random(), np.random.random()
         if self.training:
             if modality_drop_prob < self.modality_dropout:
@@ -696,7 +698,7 @@ class AVHubertModel(BaseFairseqModel):
         return feature, res["padding_mask"]
 
     def extract_finetune(self, source, padding_mask=None, mask=False, ret_conv=False, output_layer=None):
-        src_audio, src_video = source['audio'], source['video']
+        src_audio, src_video, src_articulatory = source['audio'], source['video'], source['articulatory'] # AVATAR = haven't finished
         if mask and self.masking_type == 'input':
             src_video, mask_indices_video = self.apply_input_mask(src_video, padding_mask, target_list=None)
             src_audio, mask_indices_audio = self.apply_input_mask(src_audio, padding_mask, target_list=None)
@@ -713,6 +715,7 @@ class AVHubertModel(BaseFairseqModel):
         elif src_audio is not None and src_video is not None:
             features_video = self.forward_features(src_video, modality='video')
             features_audio = self.forward_features(src_audio, modality='audio') # features: [B, F, T]
+            features_articulatory = self.forward_features(src_articulatory, modality="articulatory") # AVATAR: Haven't finsihed finetune portion
 
         if self.modality_fuse == 'concat':
             features = torch.cat([features_audio, features_video], dim=1)
