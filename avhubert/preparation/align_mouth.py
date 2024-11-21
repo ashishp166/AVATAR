@@ -86,7 +86,7 @@ def cut_patch(img, landmarks, height, width, threshold=5):
                          int(round(center_x) - round(width)): int(round(center_x) + round(width))])
     return cutted_img
 
-def write_video_ffmpeg(rois, target_path, ffmpeg):
+def write_video_ffmpeg(rois, target_path, ffmpeg, audio_path=""):
     os.makedirs(os.path.dirname(target_path), exist_ok=True)
     decimals = 10
     fps = 25
@@ -99,7 +99,8 @@ def write_video_ffmpeg(rois, target_path, ffmpeg):
     ## ffmpeg
     if os.path.isfile(target_path):
         os.remove(target_path)
-    cmd = [ffmpeg, "-f", "concat", "-safe", "0", "-i", list_fn, "-q:v", "1", "-r", str(fps), '-y', '-crf', '20', target_path]
+    audio_ffmpeg = ["-i", audio_path, "-c:a", "copy", "-map", "0:v", "-map", "1:a", "-shortest"] if audio_path else []
+    cmd = [ffmpeg, "-f", "concat", "-safe", "0", "-i", list_fn, *audio_ffmpeg, "-q:v", "1", "-r", str(fps), '-y', '-crf', '20', "-pix_fmt", "yuv420p", target_path]
     pipe = subprocess.run(cmd, stdout = subprocess.PIPE, stderr = subprocess.STDOUT)
     # rm tmp dir
     shutil.rmtree(tmp_dir)
