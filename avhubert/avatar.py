@@ -12,6 +12,7 @@ from pathlib import Path
 import librosa
 import numpy as np
 from dataclasses import dataclass
+from sparc import load_model
 
 @dataclass
 class ModelOutput:
