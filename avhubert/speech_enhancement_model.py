@@ -2,8 +2,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torchaudio
+import librosa
 import whisper
 import numpy as np
+from scipy import signal
 from typing import Dict, Optional, Tuple
 import fairseq
 from sparc import load_model
@@ -11,6 +13,7 @@ from pathlib import Path
 import random
 import soundfile as sf
 from torch.utils.data import DataLoader
+from utils import load_video
 import matplotlib.pyplot as plt
 
 class ArticulatoryEnhancementModel(nn.Module):
@@ -61,23 +64,14 @@ class ArticulatoryEnhancementModel(nn.Module):
             n_mels=80
         )
         
-    def add_noise(
-        self,
-        clean_audio: torch.Tensor,
-        noise: torch.Tensor,
-        snr_db: float
-    ) -> torch.Tensor:
-        """Add noise to clean audio at specified SNR"""
-        # Calculate signal and noise power
-        signal_power = torch.mean(clean_audio ** 2)
-        noise_power = torch.mean(noise ** 2)
-        
-        # Calculate scaling factor for noise
-        snr = 10 ** (snr_db / 10)
-        scaling_factor = torch.sqrt(signal_power / (noise_power * snr))
-        
-        # Add scaled noise
-        return clean_audio + scaling_factor * noise
+    # def add_noise(
+    #     self,
+    #     clean_audio: torch.Tensor,
+    #     noise: torch.Tensor,
+    #     snr_db: float
+    # ) -> torch.Tensor:
+    #     """Add noise to clean audio at specified SNR"""
+    #     return torchaudio.functional.add_noise(clean_audio, noise, torch.Tensor([snr_db]))
     
     def forward(
         self,
@@ -88,13 +82,12 @@ class ArticulatoryEnhancementModel(nn.Module):
         padding_mask: Optional[torch.Tensor] = None
     ) -> Dict[str, torch.Tensor]:
         # Create noisy audio
-        noisy_audio = self.add_noise(clean_audio, noise, snr_db)
+        noisy_audio = torchaudio.functional.add_noise(clean_audio, noise, torch.Tensor([snr_db]))
         
         # Extract AV-HuBERT features
         with torch.no_grad():
             avhubert_features = self.av_hubert.extract_features(
-                video,
-                noisy_audio,
+                source={'video':video, 'audio':noisy_audio},
                 padding_mask=padding_mask,
                 mask=False
             )[0]
@@ -178,39 +171,50 @@ def compute_losses(
         # 'text_loss': text_loss
     }
 
-class NoiseDataset(torch.utils.data.Dataset):
+class AVDataset(torch.utils.data.Dataset):
     def __init__(
         self,
         video_dir: str,
-        clean_audio_dir: str,
         noise_dir: str,
         max_snr_db: float = 20.0,
-        min_snr_db: float = 0.0
+        min_snr_db: float = 0.0,
+        audio_sr: int = 16000
     ):
         self.video_paths = list(Path(video_dir).glob("*.mp4"))
-        self.clean_audio_paths = list(Path(clean_audio_dir).glob("*.wav"))
         self.noise_paths = list(Path(noise_dir).glob("*.wav"))
         self.max_snr_db = max_snr_db
         self.min_snr_db = min_snr_db
-        
-        assert len(self.video_paths) == len(self.clean_audio_paths), \
-            "Number of videos and clean audio files must match"
+        self.audio_sr = audio_sr
+    
     
     def __len__(self) -> int:
         return len(self.video_paths)
     
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         # Load video frames (assuming preprocessing done)
-        video = torch.load(self.video_paths[idx])
+        video = load_video(self.video_paths[idx])
         
-        # Load audio
-        clean_audio, _ = sf.read(self.clean_audio_paths[idx])
+        # Load audio from mp4
+        clean_audio, _ = librosa.load(self.video_paths[idx], sr=self.audio_sr, mono=True)
         clean_audio = torch.from_numpy(clean_audio).float()
         
         # Load random noise
         noise_path = random.choice(self.noise_paths)
-        noise, _ = sf.read(noise_path)
+        noise, _ = librosa.load(noise_path, sr=self.audio_sr, mono=True)
         noise = torch.from_numpy(noise).float()
+
+        # Truncate or loop noise to match length of clean audio
+        clean_len = clean_audio.size(0)
+        noise_len = noise.size(0)
+        if clean_len < noise_len:
+            # TODO: could also get a random segment of the noise
+            noise = noise[:clean_len]
+        elif clean_len > noise_len:
+            n_loops = clean_len // noise_len + 1
+            # Apply Tukey window to avoid popping
+            tukey = torch.from_numpy(signal.windows.tukey(noise_len))
+            noise = noise * tukey
+            noise = noise.tile((n_loops,))[:clean_len]
         
         # Random SNR
         snr_db = random.uniform(self.min_snr_db, self.max_snr_db)
@@ -268,7 +272,7 @@ def prepare_dataset(
     video_dir: str,
     clean_audio_dir: str,
     noise_dir: str
-) -> NoiseDataset:
+) -> AVDataset:
     """
     Expected directory structure:
     video_dir/
@@ -285,19 +289,20 @@ def prepare_dataset(
         - street1.wav
         ...
     """
-    dataset = NoiseDataset(
+    dataset = AVDataset(
         video_dir=video_dir,
         clean_audio_dir=clean_audio_dir,
         noise_dir=noise_dir,
         max_snr_db=20.0,
-        min_snr_db=0.0
+        min_snr_db=0.0,
+        audio_sr=16000
     )
     return dataset
 
 def train_model(
     model: ArticulatoryEnhancementModel,
-    train_dataset: NoiseDataset,
-    val_dataset: NoiseDataset,
+    train_dataset: AVDataset,
+    val_dataset: AVDataset,
     num_epochs: int = 50,
     batch_size: int = 8,
     learning_rate: float = 1e-4,
@@ -382,8 +387,8 @@ def inference(
     output_dir.mkdir(exist_ok=True)
     
     # Load inputs
-    video = torch.load(video_path)
-    noisy_audio, sr = sf.read(noisy_audio_path)
+    video = load_video(video_path)
+    noisy_audio, _ = librosa.load(noisy_audio_path, sr=16000, mono=True)
     noisy_audio = torch.from_numpy(noisy_audio).float()
     
     # Move to device
