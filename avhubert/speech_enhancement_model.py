@@ -1,20 +1,23 @@
+import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torchaudio
 import librosa
-import whisper
 import numpy as np
 from scipy import signal
 from typing import Dict, Optional, Tuple
 import fairseq
+import hubert_pretraining
+import hubert
 from sparc import load_model
 from pathlib import Path
 import random
 import soundfile as sf
 from torch.utils.data import DataLoader
-from utils import load_video
+import moviepy.editor as mp
 import matplotlib.pyplot as plt
+from transformers import AutoModelForSpeechSeq2Seq, AutoProcessor, pipeline
 
 class ArticulatoryEnhancementModel(nn.Module):
     def __init__(
@@ -22,17 +25,38 @@ class ArticulatoryEnhancementModel(nn.Module):
         avhubert_path: str,
         hidden_dim: int = 512,
         num_lstm_layers: int = 2,
-        dropout: float = 0.1
+        dropout: float = 0.1,
+        device: str = "cpu"
     ):
         super().__init__()
         
-        # Load pretrained models
+        # Load pretrained models with specific AV-HuBERT checkpoint
         models, cfg, task = fairseq.checkpoint_utils.load_model_ensemble_and_task(
-            [avhubert_path]
+            [avhubert_path], 
         )
         self.av_hubert = models[0]
-        self.sparc_model = load_model("en")
-        self.whisper_model = whisper.load_model("base")
+        
+        # Load SPARC model
+        self.sparc_model = load_model("en") # TODO: English model so need all data to be english
+        
+        # Load Hugging Face Whisper model
+        model_id = "openai/whisper-large-v3"
+        torch_dtype = torch.float16 if torch.cuda.is_available() else torch.float32
+        self.whisper_model = AutoModelForSpeechSeq2Seq.from_pretrained(
+            model_id, 
+            torch_dtype=torch_dtype, 
+            low_cpu_mem_usage=True, 
+            use_safetensors=True
+        ).to(device)
+        self.whisper_processor = AutoProcessor.from_pretrained(model_id)
+        self.whisper_pipeline = pipeline(
+            "automatic-speech-recognition",
+            model=self.whisper_model,
+            tokenizer=self.whisper_processor.tokenizer,
+            feature_extractor=self.whisper_processor.feature_extractor,
+            torch_dtype=torch_dtype,
+            device=device
+        )
         
         # Freeze pretrained models
         for model in [self.av_hubert, self.sparc_model]:
@@ -43,7 +67,7 @@ class ArticulatoryEnhancementModel(nn.Module):
         avhubert_dim = self.av_hubert.encoder.embedding_dim
         sparc_dim = 12  # SPARC outputs 12 articulatory features
         
-        # Bidirectional LSTM for processing combined features
+        # Bidirectional LSTM for processing combined features from lab 2
         self.lstm = nn.LSTM(
             input_size=avhubert_dim + sparc_dim,
             hidden_size=hidden_dim,
@@ -56,23 +80,14 @@ class ArticulatoryEnhancementModel(nn.Module):
         # Decoder to predict clean articulatory features
         self.articulatory_decoder = nn.Linear(hidden_dim * 2, sparc_dim)
         
-        # Mel Spectrogram transform for loss calculation
-        self.mel_transform = torchaudio.transforms.MelSpectrogram(
-            sample_rate=16000,
-            n_fft=400,
-            hop_length=160,
-            n_mels=80
-        )
+        # # Mel Spectrogram transform for loss calculation
+        # self.mel_transform = torchaudio.transforms.MelSpectrogram(
+        #     sample_rate=16000,
+        #     n_fft=400,
+        #     hop_length=160,
+        #     n_mels=80
+        # )
         
-    # def add_noise(
-    #     self,
-    #     clean_audio: torch.Tensor,
-    #     noise: torch.Tensor,
-    #     snr_db: float
-    # ) -> torch.Tensor:
-    #     """Add noise to clean audio at specified SNR"""
-    #     return torchaudio.functional.add_noise(clean_audio, noise, torch.Tensor([snr_db]))
-    
     def forward(
         self,
         video: torch.Tensor,
@@ -94,11 +109,11 @@ class ArticulatoryEnhancementModel(nn.Module):
             
             # Get SPARC features for both clean and noisy audio
             clean_articulatory = torch.tensor(
-                self.sparc_model.encode(clean_audio.cpu().numpy())['ema'],
+                self.sparc_model.encode(clean_audio.cpu().numpy())['ema'], # TODO: convert to wav file: sparc/speech.py file
                 device=video.device
             )
             noisy_articulatory = torch.tensor(
-                self.sparc_model.encode(noisy_audio.cpu().numpy())['ema'],
+                self.sparc_model.encode(noisy_audio.cpu().numpy())['ema'], # TODO: convert to wav file: sparc/speech.py file
                 device=video.device
             )
         
@@ -306,7 +321,7 @@ def train_model(
     num_epochs: int = 50,
     batch_size: int = 8,
     learning_rate: float = 1e-4,
-    device: str = "cuda"
+    device: str = "cpu"
 ) -> None:
     """Training loop with validation"""
     train_loader = DataLoader(
@@ -387,7 +402,7 @@ def inference(
     output_dir.mkdir(exist_ok=True)
     
     # Load inputs
-    video = load_video(video_path)
+    video = load_video(video_path) # TODO: implement load_video
     noisy_audio, _ = librosa.load(noisy_audio_path, sr=16000, mono=True)
     noisy_audio = torch.from_numpy(noisy_audio).float()
     
@@ -400,7 +415,7 @@ def inference(
     with torch.no_grad():
         # Get SPARC features
         noisy_articulatory = torch.tensor(
-            model.sparc_model.encode(noisy_audio.cpu().numpy())['ema'],
+            model.sparc_model.encode(noisy_audio.cpu().numpy())['ema'], # TODO: this needs to be a wav file
             device=device
         )
         
@@ -426,7 +441,7 @@ def inference(
         
         # Decode to audio
         enhanced_audio = model.sparc_model.decode(
-            predicted_articulatory.cpu().numpy()
+            predicted_articulatory.cpu().numpy() # TODO: convert to wav file: sparc/speech.py file; 
         )
         
         # Generate mel spectrogram
@@ -442,7 +457,10 @@ def inference(
         )
         
         # Get transcription
-        transcription = model.whisper_model.transcribe(enhanced_audio)['text']
+        transcription = model.whisper_pipeline(
+            enhanced_audio.astype(np.float32), 
+            return_timestamps=False
+        )['text']
     
     # Save outputs
     output_paths = {}
@@ -465,3 +483,87 @@ def inference(
         'output_paths': output_paths,
         'transcription': transcription
     }
+
+
+# import random
+# import soundfile as sf
+# from torch.utils.data import DataLoader
+# import moviepy.editor as mp
+# import matplotlib.pyplot as plt
+
+# def convert_mp4_to_wav(mp4_path: str, output_dir: str) -> str:
+#     """
+#     Convert MP4 file to WAV
+    
+#     Args:
+#         mp4_path (str): Path to input MP4 file
+#         output_dir (str): Directory to save WAV file
+    
+#     Returns:
+#         str: Path to converted WAV file
+#     """
+#     # Create output directory if it doesn't exist
+#     os.makedirs(output_dir, exist_ok=True)
+    
+#     # Extract filename without extension
+#     filename = os.path.splitext(os.path.basename(mp4_path))[0]
+#     wav_path = os.path.join(output_dir, f"{filename}.wav")
+    
+#     # Load video clip
+#     video = mp.VideoFileClip(mp4_path)
+    
+#     # Extract audio
+#     audio = video.audio
+    
+#     # Write audio to WAV
+#     audio.write_audiofile(wav_path, codec='pcm_s16le', fps=16000)
+    
+#     # Close video to free resources
+#     video.close()
+    
+#     return wav_path
+
+def main():
+    # Paths
+    train_video_dir = 'train_data'
+    val_video_dir = 'val_data'
+    train_wav_dir = 'train_wav'
+    val_wav_dir = 'val_wav'
+    noise_dir = 'noise_data'
+    avhubert_checkpoint = 'base_noise_pt_noise_ft_433h.pt'
+
+    # TODO: Have to try this Convert MP4 to WAV for training and validation data using sparc/speech.py file
+    # for video_dir, wav_dir in [(train_video_dir, train_wav_dir), (val_video_dir, val_wav_dir)]:
+    #     for mp4_file in Path(video_dir).glob('*.mp4'):
+    #         convert_mp4_to_wav(str(mp4_file), wav_dir)
+
+    # Prepare datasets
+    train_dataset = AVDataset(
+        video_dir=train_video_dir,
+        clean_audio_dir=train_wav_dir,
+        noise_dir=noise_dir
+    )
+    
+    val_dataset = AVDataset(
+        video_dir=val_video_dir,
+        clean_audio_dir=val_wav_dir,
+        noise_dir=noise_dir
+    )
+
+    # Initialize model
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    model = ArticulatoryEnhancementModel(avhubert_path=avhubert_checkpoint).to(device)
+
+    # Train model
+    train_model(
+        model=model,
+        train_dataset=train_dataset,
+        val_dataset=val_dataset,
+        num_epochs=50,
+        batch_size=8,
+        learning_rate=1e-4,
+        device=device
+    )
+
+if __name__ == '__main__':
+    main()
