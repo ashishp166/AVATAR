@@ -16,6 +16,7 @@ filelock @ file:///private/var/folders/sy/f16zz6x50xz3113nwtb9bvq00000gp/T/abs_c
 fonttools==4.55.0
 fsspec==2024.10.0
 gmpy2 @ file:///opt/concourse/worker/volumes/live/fcf88d55-1134-4508-4e67-911af1733874/volume/gmpy2_1645455543921/work
+huggingface-hub==0.26.2
 hydra-core==1.0.0
 idna==3.10
 imageio==2.35.1
@@ -54,7 +55,9 @@ PyWavelets==1.4.1
 PyYAML @ file:///private/var/folders/sy/f16zz6x50xz3113nwtb9bvq00000gp/T/abs_34t43scp15/croot/pyyaml_1728658999838/work
 regex==2024.11.6
 requests==2.32.3
+resampy==0.4.3
 sacrebleu==2.4.3
+safetensors==0.4.5
 scikit-image==0.17.2
 scikit-learn==1.3.2
 scikit-video==1.1.11
@@ -68,9 +71,12 @@ sympy @ file:///private/var/folders/sy/f16zz6x50xz3113nwtb9bvq00000gp/T/abs_4by5
 tabulate==0.9.0
 threadpoolctl==3.5.0
 tifffile==2023.7.10
+tokenizers==0.20.3
 torch==2.2.2
 torchaudio==2.2.2
+torchcrepe==0.0.23
 tqdm==4.67.0
+transformers==4.46.3
 typing_extensions @ file:///private/var/folders/c_/qfmhj66j0tn016nkx_th4hxm0000gp/T/abs_0b3pj9yhn2/croot/typing_extensions_1715268854415/work
 urllib3==2.2.3
 zipp==3.20.2

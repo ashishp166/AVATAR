@@ -8,16 +8,14 @@ import numpy as np
 from scipy import signal
 from typing import Dict, Optional, Tuple
 import fairseq
-import hubert_pretraining
-import hubert
 from sparc import load_model
 from pathlib import Path
 import random
 import soundfile as sf
 from torch.utils.data import DataLoader
-import moviepy.editor as mp
 import matplotlib.pyplot as plt
 from transformers import AutoModelForSpeechSeq2Seq, AutoProcessor, pipeline
+from utils import load_video
 
 class ArticulatoryEnhancementModel(nn.Module):
     def __init__(
@@ -402,7 +400,7 @@ def inference(
     output_dir.mkdir(exist_ok=True)
     
     # Load inputs
-    video = load_video(video_path) # TODO: implement load_video
+    video = load_video(video_path)
     noisy_audio, _ = librosa.load(noisy_audio_path, sr=16000, mono=True)
     noisy_audio = torch.from_numpy(noisy_audio).float()
     
@@ -485,68 +483,24 @@ def inference(
     }
 
 
-# import random
-# import soundfile as sf
-# from torch.utils.data import DataLoader
-# import moviepy.editor as mp
-# import matplotlib.pyplot as plt
-
-# def convert_mp4_to_wav(mp4_path: str, output_dir: str) -> str:
-#     """
-#     Convert MP4 file to WAV
-    
-#     Args:
-#         mp4_path (str): Path to input MP4 file
-#         output_dir (str): Directory to save WAV file
-    
-#     Returns:
-#         str: Path to converted WAV file
-#     """
-#     # Create output directory if it doesn't exist
-#     os.makedirs(output_dir, exist_ok=True)
-    
-#     # Extract filename without extension
-#     filename = os.path.splitext(os.path.basename(mp4_path))[0]
-#     wav_path = os.path.join(output_dir, f"{filename}.wav")
-    
-#     # Load video clip
-#     video = mp.VideoFileClip(mp4_path)
-    
-#     # Extract audio
-#     audio = video.audio
-    
-#     # Write audio to WAV
-#     audio.write_audiofile(wav_path, codec='pcm_s16le', fps=16000)
-    
-#     # Close video to free resources
-#     video.close()
-    
-#     return wav_path
-
 def main():
     # Paths
-    train_video_dir = 'train_data'
-    val_video_dir = 'val_data'
-    train_wav_dir = 'train_wav'
-    val_wav_dir = 'val_wav'
-    noise_dir = 'noise_data'
-    avhubert_checkpoint = 'base_noise_pt_noise_ft_433h.pt'
-
-    # TODO: Have to try this Convert MP4 to WAV for training and validation data using sparc/speech.py file
-    # for video_dir, wav_dir in [(train_video_dir, train_wav_dir), (val_video_dir, val_wav_dir)]:
-    #     for mp4_file in Path(video_dir).glob('*.mp4'):
-    #         convert_mp4_to_wav(str(mp4_file), wav_dir)
+    data_dir = "./data"
+    train_video_dir = os.path.join(data_dir, 'train_data')
+    val_video_dir = os.path.join(data_dir, 'val_data')
+    # train_wav_dir = os.path.join(data_dir, 'train_wav')
+    # val_wav_dir = os.path.join(data_dir, 'val_wav')
+    noise_dir = os.path.join(data_dir, 'noise_data')
+    avhubert_checkpoint = os.path.join(data_dir, 'base_lrs3_iter5.pt')
 
     # Prepare datasets
     train_dataset = AVDataset(
         video_dir=train_video_dir,
-        clean_audio_dir=train_wav_dir,
         noise_dir=noise_dir
     )
     
     val_dataset = AVDataset(
         video_dir=val_video_dir,
-        clean_audio_dir=val_wav_dir,
         noise_dir=noise_dir
     )
 
