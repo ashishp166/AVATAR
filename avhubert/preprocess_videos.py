@@ -1,10 +1,15 @@
 import dlib, os
 import argparse
 import numpy as np
+import librosa
+import soundfile as sf
 from tqdm import tqdm
-from pathlib import Path
 from preparation.align_mouth import landmarks_interpolate, crop_patch, write_video_ffmpeg
 from utils import load_video
+
+def save_audio_as_wav(input_file, output_file, sr=16000):
+    audio, _ = librosa.load(input_file, sr=sr)
+    sf.write(output_file, audio, sr)
 
 # Based on code from AVHubert Colab notebook
 def detect_landmark(image, detector, predictor):
@@ -53,6 +58,8 @@ if __name__ == "__main__":
 
     ffmpeg_path = "/Users/monicatang/opt/anaconda3/envs/avatar/bin/ffmpeg"
 
+    # TODO: walk through files following the AVSpeech file structure
     for vid_file in tqdm([f for f in os.listdir(video_dir) if f.endswith(".mp4")]):
+        # TODO: need to filter out videos with multiple faces (and non-English videos?)
         out_file = os.path.join(out_dir, vid_file)
         preprocess_video(os.path.join(video_dir, vid_file), out_file, args.predictor, args.mean, ffmpeg_path=ffmpeg_path)
