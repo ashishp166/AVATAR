@@ -8,14 +8,35 @@ import numpy as np
 from scipy import signal
 from typing import Dict, Optional, Tuple
 import fairseq
-from sparc import load_model
+from avhubert.sparc import load_model
 from pathlib import Path
 import random
 import soundfile as sf
 from torch.utils.data import DataLoader
 import matplotlib.pyplot as plt
 from transformers import AutoModelForSpeechSeq2Seq, AutoProcessor, pipeline
-from utils import load_video
+from avhubert.utils import load_video
+# import sys
+
+import fairseq.fairseq.utils as utils
+# from fairseq.fairseq import checkpoint_utils, tasks
+
+# # Add these lines before creating the ArticulatoryEnhancementModel
+# import sys
+# sys.path.append(".")  # Add current directory to path
+# utils.import_user_module({"user_dir": "avhubert"})
+from argparse import Namespace
+
+# Add these lines before creating the ArticulatoryEnhancementModel
+import sys
+sys.path.append(".")  # Add current directory to path
+
+# Get the absolute path to your avhubert directory
+current_dir = os.path.dirname(os.path.abspath(__file__))
+avhubert_path = os.path.join(current_dir, "avhubert")
+
+# Import using Namespace
+utils.import_user_module(Namespace(user_dir=avhubert_path))
 
 class ArticulatoryEnhancementModel(nn.Module):
     def __init__(
@@ -485,7 +506,7 @@ def inference(
 
 def main():
     # Paths
-    data_dir = "./data"
+    data_dir = "./avhubert/data"
     train_video_dir = os.path.join(data_dir, 'train_data')
     val_video_dir = os.path.join(data_dir, 'val_data')
     # train_wav_dir = os.path.join(data_dir, 'train_wav')
