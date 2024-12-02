@@ -12,7 +12,8 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 
 from dataclasses import dataclass, field
-from fairseq import metrics, search
+from fairseq.logging import metrics
+from fairseq import search
 from fairseq.data import Dictionary, encoders
 from fairseq.dataclass.configs import FairseqDataclass
 from fairseq.tasks import register_task
@@ -24,8 +25,8 @@ from argparse import Namespace
 DBG=True if len(sys.argv) == 1 else False
 
 if DBG:
-    from hubert_dataset import AVHubertDataset
-    from sequence_generator import SequenceGenerator
+    from .hubert_dataset import AVHubertDataset
+    from .sequence_generator import SequenceGenerator
 else:
     from .hubert_dataset import AVHubertDataset
     from .sequence_generator import SequenceGenerator
@@ -273,7 +274,7 @@ class AVHubertPretrainingTask(FairseqTask):
             image_std=self.cfg.image_std,
             image_crop_size=self.cfg.image_crop_size,
             image_aug=image_aug,
-            modalities=self.cfg.modalities,
+            # modalities=self.cfg.modalities,
             is_s2s=self.cfg.is_s2s,
             noise_fn=noise_fn,
             noise_prob=self.cfg.noise_prob,
