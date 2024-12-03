@@ -127,22 +127,22 @@ def load_and_analyze_data(preprocess_file='preprocessed_data.pkl'):
     """
     Load preprocessed data and perform detailed analysis
     """
-    X, y = joblib.load(preprocess_file)
-    X_processed = []
-    y_processed = []
-    for i in range(len(X)):
-        if X[i].shape[0] > y[i].shape[0]:
-            X[i] = resample(X[i], y[i].shape[0])
-            X_processed.append(X[i])
-            y_processed.append(y[i])    
+    avhubert_embedding, ema_data = joblib.load(preprocess_file)
+    avhubert_processed = []
+    ema_data_processed = []
+    for i in range(len(avhubert_embedding)):
+        if avhubert_embedding[i].shape[0] > ema_data[i].shape[0]:
+            avhubert_embedding[i] = resample(avhubert_embedding[i], ema_data[i].shape[0])
+            avhubert_processed.append(avhubert_embedding[i])
+            ema_data_processed.append(ema_data[i])    
         else:
-            y[i] = resample(y[i], X[i].shape[0])
-            y_processed.append(y[i])
-            X_processed.append(X[i])
+            ema_data[i] = resample(ema_data[i], avhubert_embedding[i].shape[0])
+            ema_data_processed.append(ema_data[i])
+            avhubert_processed.append(avhubert_embedding[i])
 
-    X = np.vstack(X_processed)
-    y = np.vstack(y_processed)
-    return X, y
+    avhubert_embedding = np.vstack(avhubert_processed)
+    ema_data = np.vstack(ema_data_processed)
+    return avhubert_embedding, ema_data
 
 class EMAReconstructionModel(nn.Module):
     def __init__(self, 
@@ -229,7 +229,7 @@ class EMAReconstructionModel(nn.Module):
             return loss
         return reconstructed_ema
 
-def concatenate_embeddings(X, y):
+def concatenate_embeddings(avhubert_embedding, ema_data):
     """
     Concatenate X embeddings with Y values along the feature dimension.
     
@@ -242,9 +242,9 @@ def concatenate_embeddings(X, y):
     Returns:
     numpy.ndarray: Concatenated embeddings with shape (num_samples, 293, 780)
     """
-    assert X.shape[0] == y.shape[0], "Number of timesteps must match"
-    X_concatenated = np.concatenate([X, y], axis=-1)
-    return X_concatenated
+    assert avhubert_embedding.shape[0] == ema_data.shape[0], "Number of timesteps must match"
+    avatar_embedding = np.concatenate([avhubert_embedding, ema_data], axis=-1)
+    return avatar_embedding
 
 def split_data(X, y, test_size=0.2, val_size=0.2, random_state=42):
     """
@@ -352,11 +352,12 @@ def train_and_evaluate(model, train_loader, val_loader, test_loader,
     return model, train_losses, val_losses
 
 def main():
-    X, y = load_and_analyze_data()
-    X_combined = concatenate_embeddings(X, y)
-    X_train, X_val, X_test, y_train, y_val, y_test = split_data(X_combined, y)
+    avhubert_embedding, ema_embedding = load_and_analyze_data()
+    avatar_embedding = concatenate_embeddings(avhubert_embedding, ema_embedding)
+    avatar_embedding_train, avatar_embedding_val, avatar_embedding_test, clean_ema_train, clean_ema_val, clean_ema_test = split_data(avatar_embedding, ema_embedding) # this should be second as the clean ema values
     train_loader, val_loader, test_loader = create_dataloaders(
-        X_train, X_val, X_test, y_train, y_val, y_test
+        avatar_embedding_train, avatar_embedding_val, avatar_embedding_test, 
+        clean_ema_train, clean_ema_val, clean_ema_test
     )
     model = EMAReconstructionModel()
     trained_model, train_losses, val_losses = train_and_evaluate(
