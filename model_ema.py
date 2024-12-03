@@ -51,12 +51,12 @@ class EMADataset:
     
     def _default_embedding_extractor(self):
         """Create default AV-HuBERT embedding extractor"""
-        # model = HubertModel.from_pretrained("facebook/hubert-base-ls960")
+        model = HubertModel.from_pretrained("facebook/hubert-base-ls960")
         
-        avhubert_path = "./avhubert/data/base_lrs3_iter5.pt"
-        av_hubert_models, _, _ = load_model_ensemble_and_task([avhubert_path])
-        model = av_hubert_models[0]
-        model.eval()
+        # avhubert_path = "./avhubert/data/base_lrs3_iter5.pt"
+        # av_hubert_models, _, _ = load_model_ensemble_and_task([avhubert_path])
+        # model = av_hubert_models[0]
+        # model.eval()
         
         def extract_embeddings(wav_path):
             waveform, sr = torchaudio.load(wav_path)
@@ -68,7 +68,8 @@ class EMADataset:
             
             with torch.no_grad():
                 # TODO: what to input as "video" when using AVHubert?
-                outputs = model({'video': np.array([]), 'audio': waveform})
+                # outputs = model({'video': None, 'audio': waveform}) # np.array([])
+                outputs = model(waveform)
                 embeddings = outputs.last_hidden_state.squeeze().numpy()
             # print(embeddings.shape)
             return embeddings
