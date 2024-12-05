@@ -4,7 +4,7 @@ import torch
 import torchaudio
 from pathlib import Path
 from transformers import HubertModel
-from avhubert.hubert import AVHubertModel   # this import fixes the "Could not infer task type AssertionError"
+from avhubert.audio_hubert import AVHubertModel   # this import fixes the "Could not infer task type AssertionError"
 import matplotlib.pyplot as plt
 import seaborn as sns
 import logging
@@ -16,6 +16,7 @@ from sklearn.metrics import mean_squared_error, r2_score, mean_absolute_error
 from sklearn.linear_model import Ridge, Lasso, LinearRegression, RidgeCV
 from scipy.signal import resample
 from fairseq.checkpoint_utils import load_model_ensemble_and_task
+from python_speech_features import logfbank
 
 logging.basicConfig(level=logging.INFO, 
                     format='%(asctime)s - %(levelname)s: %(message)s',
@@ -25,55 +26,75 @@ logger = logging.getLogger(__name__)
 import joblib
 
 class EMADataset:
-    def __init__(self, ema_data_dir, wav_data_dir, embedding_extractor=None, limit_files=None, preprocess_file="preprocessed_data.pkl"):
+    def __init__(self, ema_data_dir, wav_data_dir, AVHubert=True, embedding_extractor=None, limit_files=None, preprocess_file="preprocessed_data"):
         self.ema_data_dir = Path(ema_data_dir)
         self.wav_data_dir = Path(wav_data_dir)
-        self.preprocess_file = preprocess_file
-        
-        # Load wav and EMA files
+        self.AVHubert = AVHubert
+        if self.AVHubert:
+            self.preprocess_file = preprocess_file + "_avhubert.pkl"
+        else:
+            self.preprocess_file = preprocess_file + "_hubert.pkl"
         self.wav_files = sorted(list(self.wav_data_dir.glob('*.wav')))
         self.ema_files = sorted(list(self.ema_data_dir.glob('*.npy')))
         
-        # Limit files if specified
         if limit_files is not None:
             self.wav_files = self.wav_files[:limit_files]
             self.ema_files = self.ema_files[:limit_files]
         
-        # Verify file matching
         assert len(self.wav_files) == len(self.ema_files), "Number of wav and EMA files must match"
         assert all(wav.stem == ema.stem for wav, ema in zip(self.wav_files, self.ema_files)), "File names must match"
         
-        # Embedding extractor
         self.embedding_extractor = embedding_extractor or self._default_embedding_extractor()
         
-        # Precompute and preprocess data, or load if cached
-        self.X, self.y = self._preprocess_data()
+        self.X, self.y = self._preprocess_data() # load cached values if avalible
     
     def _default_embedding_extractor(self):
         """Create default AV-HuBERT embedding extractor"""
-        model = HubertModel.from_pretrained("facebook/hubert-base-ls960")
-        
-        # avhubert_path = "./avhubert/data/base_lrs3_iter5.pt"
-        # av_hubert_models, _, _ = load_model_ensemble_and_task([avhubert_path])
-        # model = av_hubert_models[0]
-        # model.eval()
-        
+        if self.AVHubert:
+            avhubert_path = "./avhubert/data/base_lrs3_iter5.pt"
+            av_hubert_models, _, _ = load_model_ensemble_and_task([avhubert_path])
+            model = av_hubert_models[0]
+            model.eval()
+        else:
+            model = HubertModel.from_pretrained("facebook/hubert-base-ls960")
+        def stacker(feats, stack_order):
+            """
+            Concatenating consecutive audio frames
+            Args:
+            feats - numpy.ndarray of shape [T, F]
+            stack_order - int (number of neighboring frames to concatenate
+            Returns:
+            feats - numpy.ndarray of shape [T', F']
+            """
+            feat_dim = feats.shape[1]
+            if len(feats) % stack_order != 0:
+                res = stack_order - len(feats) % stack_order
+                res = np.zeros([res, feat_dim]).astype(feats.dtype)
+                feats = np.concatenate([feats, res], axis=0)
+            feats = feats.reshape((-1, stack_order, feat_dim)).reshape(-1, stack_order*feat_dim)
+            return feats
         def extract_embeddings(wav_path):
             waveform, sr = torchaudio.load(wav_path)
-            
             # Resample if needed
             if sr != 16000:
                 resampler = torchaudio.transforms.Resample(orig_freq=sr, new_freq=16000)
                 waveform = resampler(waveform)
-            
             with torch.no_grad():
                 # TODO: what to input as "video" when using AVHubert?
-                # outputs = model({'video': None, 'audio': waveform}) # np.array([])
-                outputs = model(waveform)
-                embeddings = outputs.last_hidden_state.squeeze().numpy()
+                if self.AVHubert:
+                    stack_order_audio = 4
+                    audio_feats = logfbank(waveform, samplerate=16000).astype(np.float32) # [T, F]
+                    audio_feats = stacker(audio_feats, stack_order_audio) # [T/stack_order_audio, F*stack_order_audio]
+                    audio_feats = torch.from_numpy(audio_feats)  # Convert numpy array to PyTorch tensor
+                    audio_feats = audio_feats.unsqueeze(0)
+                    audio_feats = audio_feats.transpose(1, 2)
+                    outputs = model(source={'video': None, 'audio': audio_feats}, padding_mask=None, output_layer=None) # np.array([])
+                    embeddings = outputs['logit_list'][0]
+                else:
+                    outputs = model(waveform)
+                    embeddings = outputs.last_hidden_state.squeeze().numpy()
             # print(embeddings.shape)
-            return embeddings
-        
+            return embeddings       
         return extract_embeddings
 
 
@@ -90,22 +111,13 @@ class EMADataset:
             logger.info("Preprocessing data...")
             embeddings = []
             ema_values = []
-            
             for wav_file, ema_file in zip(self.wav_files, self.ema_files):
-                # Extract embeddings from wav file
                 wav_embeddings = self.embedding_extractor(wav_file)
-                
-                # Load entire EMA values from numpy file
                 wav_ema = np.load(ema_file)
-                
                 embeddings.append(wav_embeddings)
                 ema_values.append(wav_ema)
-            
-            # Convert to numpy arrays
             X = np.array(embeddings)
             y = np.array(ema_values)
-            
-            # Save preprocessed data to file for future use
             joblib.dump((X, y), self.preprocess_file)
             logger.info(f"Preprocessed data saved to {self.preprocess_file}")
         
@@ -139,7 +151,7 @@ def ridge_lasso_regression(X, y, test_size=0.2):
         'Linear Regression': {
             'pipeline': Pipeline([
                 ('scaler', StandardScaler()),
-                ('pca', PCA(n_components=0.95)),  # Retain 95% variance
+                # ('pca', PCA(n_components=0.95)),  # Retain 95% variance
                 ('regressor', LinearRegression())
             ]),
             'alphas': [None]  # No regularization
@@ -147,7 +159,7 @@ def ridge_lasso_regression(X, y, test_size=0.2):
         'Ridge Regression': {
             'pipeline': Pipeline([
                 ('scaler', StandardScaler()),
-                ('pca', PCA(n_components=0.95)),  # Retain 95% variance
+                # ('pca', PCA(n_components=0.95)),  # Retain 95% variance
                 ('regressor', Ridge())
             ]),
             'alphas': [0.1, 1.0, 10.0]
@@ -155,7 +167,7 @@ def ridge_lasso_regression(X, y, test_size=0.2):
         'RidgeCV Regression': {
             'pipeline': Pipeline([
                 ('scaler', StandardScaler()),
-                ('pca', PCA(n_components=0.95)),  # Retain 95% variance
+                # ('pca', PCA(n_components=0.95)),  # Retain 95% variance
                 ('regressor', RidgeCV(alphas=[0.1, 1.0, 10.0, 100.0]))
             ]),
             'alphas': [None]  # RidgeCV handles alpha selection internally
@@ -163,7 +175,7 @@ def ridge_lasso_regression(X, y, test_size=0.2):
         'Lasso Regression': {
             'pipeline': Pipeline([
                 ('scaler', StandardScaler()),
-                ('pca', PCA(n_components=0.95)),
+                # ('pca', PCA(n_components=0.95)),
                 ('regressor', Lasso())
             ]),
             'alphas': [0.1, 1.0, 10.0]
@@ -183,36 +195,27 @@ def ridge_lasso_regression(X, y, test_size=0.2):
         best_model = None
         best_metrics = None
         best_alpha = None
-        
-        # Try different alpha values
         for alpha in model_config['alphas']:
-            # Create a copy of the pipeline to set the current alpha
             if name == 'Ridge Regression':
                 model_config['pipeline'].named_steps['regressor'].alpha = alpha
             elif name == 'Lasso Regression':
                 model_config['pipeline'].named_steps['regressor'].alpha = alpha
             
-            # Perform cross-validation
             cv_scores_mse = -cross_val_score(model_config['pipeline'], X, y, scoring='neg_mean_squared_error', cv=cv)
             cv_scores_r2 = cross_val_score(model_config['pipeline'], X, y, scoring='r2', cv=cv)
             
-            # Fit on training data
             model_config['pipeline'].fit(X_train, y_train)
             
-            # Predictions
             y_pred = model_config['pipeline'].predict(X_test)
             
-            # Detailed metrics for each output dimension
             test_mse = mean_squared_error(y_test, y_pred, multioutput='raw_values')
             test_r2 = r2_score(y_test, y_pred, multioutput='raw_values')
             test_mae = mean_absolute_error(y_test, y_pred, multioutput='raw_values')
             
-            # Average metrics across all dimensions
             avg_mse = np.mean(test_mse)
             avg_r2 = np.mean(test_r2)
             avg_mae = np.mean(test_mae)
             
-            # Logging for each alpha
             logger.info(f"\nAlpha: {alpha}")
             logger.info(f"Cross-Validation MSE: {cv_scores_mse.mean():.4f} ± {cv_scores_mse.std():.4f}")
             logger.info(f"Cross-Validation R2: {cv_scores_r2.mean():.4f} ± {cv_scores_r2.std():.4f}")
@@ -220,7 +223,6 @@ def ridge_lasso_regression(X, y, test_size=0.2):
             logger.info(f"Average Test R2: {avg_r2:.4f}")
             logger.info(f"Average Test MAE: {avg_mae:.4f}")
             
-            # Detailed per-dimension metrics
             logger.info("\nPer-Dimension Metrics:")
             for dim in range(y.shape[1]):
                 logger.info(f"Dimension {dim}:")
@@ -228,7 +230,6 @@ def ridge_lasso_regression(X, y, test_size=0.2):
                 logger.info(f"  R2: {test_r2[dim]:.4f}")
                 logger.info(f"  MAE: {test_mae[dim]:.4f}")
             
-            # Track best model
             if best_model is None or avg_mse < (best_metrics['avg_mse'] if best_metrics else float('inf')):
                 best_model = model_config['pipeline']
                 best_metrics = {
@@ -245,14 +246,12 @@ def ridge_lasso_regression(X, y, test_size=0.2):
                 }
                 best_alpha = alpha
         
-        # Store results for this model
         results[name] = {
             'model': best_model,
             'metrics': best_metrics,
             'best_alpha': best_alpha
         }
     
-    # Determine overall best model
     best_model_name = min(results, key=lambda x: results[x]['metrics']['avg_mse'])
     
     logger.info("\n" + "=" * 50)
@@ -268,19 +267,6 @@ def ridge_lasso_regression(X, y, test_size=0.2):
     return results, results[best_model_name]['model'], results[best_model_name]['metrics']
 
 def visualize_data_and_metrics(X, y, results):
-    """
-    Visualize data characteristics and model performance
-    """
-    # Print first X and Y values for inspection
-    print("First X (embedding) value:")
-    print(X[0])
-    print("\nShape of X:", X.shape)
-    
-    print("\nFirst Y (EMA) value:")
-    print(y[0])
-    print("\nShape of Y:", y.shape)
-    
-    # Create a figure with multiple subplots for comprehensive visualization
     plt.figure(figsize=(15, 10))
     
     # Subplot 1: Distribution of X features
@@ -317,13 +303,12 @@ def visualize_data_and_metrics(X, y, results):
     plt.savefig('model_performance_analysis.png')
     plt.close()
 
-def load_and_analyze_data(preprocess_file='preprocessed_data.pkl'):
-    """
-    Load preprocessed data and perform detailed analysis
-    """
-    # Load data
+def resample_data(avHubert: bool= True):
+    if avHubert:
+       preprocess_file = 'preprocessed_data_avhubert.pkl'
+    else:
+        preprocess_file = 'preprocessed_data_hubert.pkl'
     X, y = joblib.load(preprocess_file)
-    # If the HuBERT embeddings have more time steps, downsample
     X_processed = []
     y_processed = []
     for i in range(len(X)):
@@ -343,13 +328,13 @@ def load_and_analyze_data(preprocess_file='preprocessed_data.pkl'):
 def main():
     EMA_DATA_DIR = './mngu0_package/ema'
     WAV_DATA_DIR = './mngu0_package/wav'
+    modelAVHubert = False
+    dataset = EMADataset(EMA_DATA_DIR, WAV_DATA_DIR, AVHubert=modelAVHubert)
     
-    dataset = EMADataset(EMA_DATA_DIR, WAV_DATA_DIR)
-    
-    X, y = dataset.get_data()
-    X, y = load_and_analyze_data()
-    results, best_model, model_metrics = ridge_lasso_regression(X, y)
-    visualize_data_and_metrics(X, y, results)
+    hubert_embedding, clean_ema_data = dataset.get_data()
+    hubert_embedding, clean_ema_data = resample_data(modelAVHubert)
+    results, best_model, model_metrics = ridge_lasso_regression(hubert_embedding, clean_ema_data)
+    visualize_data_and_metrics(hubert_embedding, clean_ema_data, results)
 
 if __name__ == '__main__':
     main()
