@@ -2,9 +2,15 @@ import os
 import numpy as np
 import torch
 import torchaudio
+import librosa
+import scipy.signal as signal
+import random
 from pathlib import Path
 from transformers import HubertModel
 from avhubert.hubert import AVHubertModel   # this import fixes the "Could not infer task type AssertionError"
+from avhubert.utils import load_video
+from avhubert.sparc import load_model
+from python_speech_features import logfbank
 # import matplotlib.pyplot as plt
 # import seaborn as sns
 import logging
@@ -26,6 +32,8 @@ logging.basicConfig(level=logging.INFO,
                     format='%(asctime)s - %(levelname)s: %(message)s',
                     datefmt='%Y-%m-%d %H:%M:%S')
 logger = logging.getLogger(__name__)
+logging.getLogger('numba').setLevel(logging.WARNING)
+logging.getLogger("urllib3").setLevel(logging.WARNING)
 
 import joblib
 
@@ -41,108 +49,172 @@ class AvatarDATASET(Dataset):
         # Convert to torch tensors
         self.X = torch.tensor(X, dtype=torch.float32)
         self.y = torch.tensor(y, dtype=torch.float32)
-    
+
     def __len__(self):
         return len(self.X)
     
     def __getitem__(self, idx):
         return self.X[idx], self.y[idx]
     
-class EMADataset:
-    def __init__(self, ema_data_dir, wav_data_dir, embedding_extractor=None, limit_files=None, preprocess_file="preprocessed_data.pkl"):
-        self.ema_data_dir = Path(ema_data_dir)
-        self.wav_data_dir = Path(wav_data_dir)
+class AvatarDataPreprocessor():
+    def __init__(self, video_data_dir, noise_data_dir, snr=3, embedding_extractor=None, limit_files=None, preprocess_file="preprocessed_avatar_data.pkl", avhubert_path=None):
+        self.video_data_dir = Path(video_data_dir)
+        self.noise_data_dir = Path(noise_data_dir)
         self.preprocess_file = preprocess_file
-        self.wav_files = sorted(list(self.wav_data_dir.glob('*.wav')))
-        self.ema_files = sorted(list(self.ema_data_dir.glob('*.npy')))
+        self.video_files = sorted(list(self.video_data_dir.glob('*.mp4')))
+        self.noise_files = sorted(list(self.noise_data_dir.glob('*.wav')))
         
         if limit_files is not None:
-            self.wav_files = self.wav_files[:limit_files]
-            self.ema_files = self.ema_files[:limit_files]
+            self.video_files = self.video_files[:limit_files]
+            self.noise_files = self.noise_files[:limit_files]
         
-        assert len(self.wav_files) == len(self.ema_files), "Number of wav and EMA files must match"
-        assert all(wav.stem == ema.stem for wav, ema in zip(self.wav_files, self.ema_files)), "File names must match"
-        self.embedding_extractor = embedding_extractor or self._default_embedding_extractor()
+        # https://github.com/facebookresearch/av_hubert/issues/85#issuecomment-1836827405
+        self.stack_order_audio = 4
+        self.snr = snr
+
+        self.embedding_extractor = embedding_extractor or self._default_embedding_extractor(avhubert_path)
         
         # Precompute and preprocess data, or load if cached
-        self.X, self.y = self._preprocess_data()
+        self.X, self.X_ema, self.y = self._preprocess_data()
     
-    def _default_embedding_extractor(self):
-        """Create default AV-HuBERT embedding extractor"""
-        model = HubertModel.from_pretrained("facebook/hubert-base-ls960")
-        
-        # avhubert_path = "./avhubert/data/base_lrs3_iter5.pt"
-        # av_hubert_models, _, _ = load_model_ensemble_and_task([avhubert_path])
-        # model = av_hubert_models[0]
-        # model.eval()
-        
-        def extract_embeddings(wav_path):
-            waveform, sr = torchaudio.load(wav_path)
-            
-            # Resample if needed
-            if sr != 16000:
-                resampler = torchaudio.transforms.Resample(orig_freq=sr, new_freq=16000)
-                waveform = resampler(waveform)
-            
+    def _default_embedding_extractor(self, avhubert_path):
+        """Create default AV-HuBERT embedding extractor"""   
+        if not avhubert_path:
+            raise ValueError("Provide the path to an AVHubert checkpoint")     
+        av_hubert_models, _, _ = load_model_ensemble_and_task([avhubert_path])
+        model = av_hubert_models[0]
+        model.eval()
+        self.model = model
+        self.sparc_encoder = load_model("multi", device= "cpu", use_penn=False, ft_sr=25)
+
+        def extract_embeddings(video_frames, noisy_audio_feat, noisy_wav, clean_wav):
             with torch.no_grad():
-                # TODO: what to input as "video" when using AVHubert?
-                # outputs = model({'video': None, 'audio': waveform}) # np.array([])
-                outputs = model(waveform)
-                embeddings = outputs.last_hidden_state.squeeze().numpy()
-            return embeddings
+                video_frames = video_frames.reshape((1, 1, *video_frames.shape))    # video [B, C, T, W, H]
+                noisy_audio_feat = noisy_audio_feat.unsqueeze(0).permute(0,2,1)  # audio features [B, F, T]
+                
+                outputs = self.model(source={'video': video_frames, 'audio': noisy_audio_feat}, features_only=True) 
+                av_embeddings = outputs["features"].squeeze().numpy()
+                noisy_ema = self.sparc_encoder.encode(noisy_wav.numpy().flatten())["ema"]
+                clean_ema = self.sparc_encoder.encode(clean_wav.numpy().flatten())["ema"]
+            return av_embeddings, noisy_ema, clean_ema
         
         return extract_embeddings
+    
+    def _augment_with_noise(self, speech, noise, snr):
+        # Truncate or loop noise to match length of clean audio
+        clean_len = speech.shape[-1]
+        noise_len = noise.shape[-1]
+        if clean_len < noise_len:
+            # TODO: could also get a random segment of the noise
+            noise = noise[:, :clean_len]
+        elif clean_len > noise_len:
+            n_loops = clean_len // noise_len + 1
+            # Apply Tukey window to avoid popping
+            tukey = torch.from_numpy(np.expand_dims(signal.windows.tukey(noise_len), 0))
+            noise = noise * tukey
+            noise = noise.tile((1, n_loops))[:, :clean_len]
 
+        noisy_speech = torchaudio.functional.add_noise(speech, noise, torch.Tensor([snr]))
+        return noisy_speech
 
-    # Modify _preprocess_data method in EMADataset class
     def _preprocess_data(self):
         """
         Preprocess embeddings and EMA data with consistent shapes, caching the results
         """
         if Path(self.preprocess_file).exists():
             logger.info(f"Loading preprocessed data from {self.preprocess_file}")
-            X, y = joblib.load(self.preprocess_file)
+            X, X_ema, y = joblib.load(self.preprocess_file)
         else:
             logger.info("Preprocessing data...")
-            embeddings = []
-            ema_values = []
+            avhubert_embedding = []
+            noisy_ema_embedding = []
+            clean_ema_embedding = []
+
+            SAMPLE_RATE = 16000
+
+            def _stacker(feats, stack_order):
+                """
+                Concatenating consecutive audio frames
+                Args:
+                feats - numpy.ndarray of shape [T, F]
+                stack_order - int (number of neighboring frames to concatenate
+                Returns:
+                feats - numpy.ndarray of shape [T', F']
+                """
+                feat_dim = feats.shape[1]
+                if len(feats) % stack_order != 0:
+                    res = stack_order - len(feats) % stack_order
+                    res = np.zeros([res, feat_dim]).astype(feats.dtype)
+                    feats = np.concatenate([feats, res], axis=0)
+                feats = feats.reshape((-1, stack_order, feat_dim)).reshape(-1, stack_order*feat_dim)
+                return feats
             
-            for wav_file, ema_file in zip(self.wav_files, self.ema_files):
-                wav_embeddings = self.embedding_extractor(wav_file)
-                wav_ema = np.load(ema_file)
-                embeddings.append(wav_embeddings)
-                ema_values.append(wav_ema)
-            X = np.array(embeddings)
-            y = np.array(ema_values)
-            joblib.dump((X, y), self.preprocess_file)
+            for video_file in self.video_files:
+                # Load video and wav
+                video_file = str(video_file)
+                noise_file = str(random.choice(self.noise_files))
+
+                video_frames = torch.from_numpy(load_video(video_file).astype(np.float32))
+                clean_wav, _ = librosa.load(video_file, sr=SAMPLE_RATE)
+                clean_wav = torch.from_numpy(np.expand_dims(clean_wav, 0))
+                
+                noise_wav, sr = torchaudio.load(noise_file)
+                # Resample if needed
+                if sr != SAMPLE_RATE:
+                    resampler = torchaudio.transforms.Resample(orig_freq=sr, new_freq=16000)
+                    waveform = resampler(waveform)
+
+                # Get audio features for AVHubert
+                noisy_speech_wav = self._augment_with_noise(clean_wav, noise_wav, self.snr)
+                noisy_audio_feats = logfbank(noisy_speech_wav, samplerate=SAMPLE_RATE).astype(np.float32) # [T, F]
+                noisy_audio_feats = _stacker(noisy_audio_feats, self.stack_order_audio) # [T/stack_order_audio, F*stack_order_audio]
+                noisy_audio_feats = torch.from_numpy(noisy_audio_feats.astype(np.float32))
+
+                # Padding for audio features (from load_feature in hubert_dataset.py)
+                diff = len(noisy_audio_feats) - len(video_frames)
+                if diff < 0:
+                    noisy_audio_feats = np.concatenate([noisy_audio_feats, np.zeros([-diff, noisy_audio_feats.shape[-1]], dtype=noisy_audio_feats.dtype)])
+                elif diff > 0:
+                    noisy_audio_feats = noisy_audio_feats[:-diff]
+
+                av_embeddings, noisy_ema, clean_ema = self.embedding_extractor(video_frames, noisy_audio_feats, noisy_speech_wav, clean_wav)
+                avhubert_embedding.append(av_embeddings)
+                noisy_ema_embedding.append(noisy_ema)
+                clean_ema_embedding.append(clean_ema)
+            
+            X = np.array(avhubert_embedding)
+            X_ema = np.array(noisy_ema_embedding)
+            y = np.array(clean_ema_embedding)
+            joblib.dump((X, X_ema, y), self.preprocess_file)
             logger.info(f"Preprocessed data saved to {self.preprocess_file}")
         
-        return X, y
+        return X, X_ema, y
     
     def get_data(self):
         """Return preprocessed data"""
-        return self.X, self.y
+        return self.X, self.X_ema, self.y
+    
 
-def load_and_analyze_data(preprocess_file='preprocessed_data.pkl'):
+def load_and_analyze_data(preprocess_file='preprocessed_avatar_data.pkl'):
     """
     Load preprocessed data and perform detailed analysis
     """
-    avhubert_embedding, ema_data = joblib.load(preprocess_file)
+    avhubert_embedding, noisy_ema_data, clean_ema_data = joblib.load(preprocess_file)
     avhubert_processed = []
-    ema_data_processed = []
+    noisy_ema_data_processed = []
+    clean_ema_data_processed = []
     for i in range(len(avhubert_embedding)):
-        if avhubert_embedding[i].shape[0] > ema_data[i].shape[0]:
-            avhubert_embedding[i] = resample(avhubert_embedding[i], ema_data[i].shape[0])
-            avhubert_processed.append(avhubert_embedding[i])
-            ema_data_processed.append(ema_data[i])    
-        else:
-            ema_data[i] = resample(ema_data[i], avhubert_embedding[i].shape[0])
-            ema_data_processed.append(ema_data[i])
-            avhubert_processed.append(avhubert_embedding[i])
+        # Resample EMA data which has twice the number of frames as AVHubert
+        clean_ema_data[i] = resample(clean_ema_data[i], avhubert_embedding[i].shape[0])
+        noisy_ema_data[i] = resample(noisy_ema_data[i], avhubert_embedding[i].shape[0])
+        clean_ema_data_processed.append(clean_ema_data[i])
+        noisy_ema_data_processed.append(noisy_ema_data[i])
+        avhubert_processed.append(avhubert_embedding[i])
 
     avhubert_embedding = np.vstack(avhubert_processed)
-    ema_data = np.vstack(ema_data_processed)
-    return avhubert_embedding, ema_data
+    noisy_ema_data = np.vstack(noisy_ema_data_processed)
+    clean_ema_data = np.vstack(clean_ema_data_processed)
+    return avhubert_embedding, noisy_ema_data, clean_ema_data
 
 class EMAReconstructionModel(nn.Module):
     def __init__(self, 
@@ -324,7 +396,6 @@ def train_and_evaluate(model, train_loader, val_loader, test_loader,
         avg_train_loss = epoch_train_loss / len(train_loader)
         train_losses.append(avg_train_loss)
         
-
         model.eval()
         epoch_val_loss = 0
         with torch.no_grad():
@@ -352,9 +423,16 @@ def train_and_evaluate(model, train_loader, val_loader, test_loader,
     return model, train_losses, val_losses
 
 def main():
-    avhubert_embedding, ema_embedding = load_and_analyze_data()
-    avatar_embedding = concatenate_embeddings(avhubert_embedding, ema_embedding)
-    avatar_embedding_train, avatar_embedding_val, avatar_embedding_test, clean_ema_train, clean_ema_val, clean_ema_test = split_data(avatar_embedding, ema_embedding) # this should be second as the clean ema values
+    avhubert_path = "./avhubert/data/base_lrs3_iter5.pt"
+    vid_dir = "./avhubert/data/video"
+    noise_dir = "./avhubert/data/noise"
+    snr = 3
+    preprocessor = AvatarDataPreprocessor(vid_dir, noise_dir, snr=snr, avhubert_path=avhubert_path)
+
+    avhubert_embedding, noisy_ema_embedding, clean_ema_embedding = load_and_analyze_data()
+    avatar_embedding = concatenate_embeddings(avhubert_embedding, noisy_ema_embedding)
+    avatar_embedding_train, avatar_embedding_val, avatar_embedding_test, clean_ema_train, clean_ema_val, clean_ema_test = split_data(avatar_embedding, clean_ema_embedding)
+    
     train_loader, val_loader, test_loader = create_dataloaders(
         avatar_embedding_train, avatar_embedding_val, avatar_embedding_test, 
         clean_ema_train, clean_ema_val, clean_ema_test
