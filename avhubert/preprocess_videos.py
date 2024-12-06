@@ -1,26 +1,25 @@
-import dlib, os
+import dlib
+import os
 import argparse
 import numpy as np
-import librosa
-import soundfile as sf
 from tqdm import tqdm
+from pathlib import Path
 from preparation.align_mouth import landmarks_interpolate, crop_patch, write_video_ffmpeg
-from utils import load_video
-
-def save_audio_as_wav(input_file, output_file, sr=16000):
-    audio, _ = librosa.load(input_file, sr=sr)
-    sf.write(output_file, audio, sr)
+from utils import load_video_with_given_fps
+from itertools import islice
 
 # Based on code from AVHubert Colab notebook
 def detect_landmark(image, detector, predictor):
     rects = detector(image, 1)
     coords = None
+    if len(rects) > 1:  # Skip if video has multiple faces
+        return coords, True
     for (_, rect) in enumerate(rects):
         shape = predictor(image, rect)
         coords = np.zeros((68, 2), dtype=np.int32)
         for i in range(0, 68):
             coords[i] = (shape.part(i).x, shape.part(i).y)
-    return coords
+    return coords, False
 
 def preprocess_video(input_video_path, output_video_path, face_predictor_path, mean_face_path, ffmpeg_path='usr/bin/ffmpeg'):
     detector = dlib.get_frontal_face_detector()
@@ -28,13 +27,16 @@ def preprocess_video(input_video_path, output_video_path, face_predictor_path, m
     STD_SIZE = (256, 256)
     mean_face_landmarks = np.load(mean_face_path)
     stablePntsIDs = [33, 36, 39, 42, 45]
-    frames = load_video(input_video_path)
+    frames = load_video_with_given_fps(input_video_path, target_fps=25, pix_fmt='gray')
     landmarks = []
     for frame in tqdm(frames, leave=False):
-        landmark = detect_landmark(frame, detector, predictor)
+        landmark, has_multiple_faces = detect_landmark(frame, detector, predictor)
+        if has_multiple_faces:
+            print(f"Skip {input_video_path}")
+            return
         landmarks.append(landmark)
     preprocessed_landmarks = landmarks_interpolate(landmarks)
-    rois = crop_patch(input_video_path, preprocessed_landmarks, mean_face_landmarks, stablePntsIDs, STD_SIZE, 
+    rois = crop_patch(input_video_path, len(frames), preprocessed_landmarks, mean_face_landmarks, stablePntsIDs, STD_SIZE, 
                             window_margin=12, start_idx=48, stop_idx=68, crop_height=96, crop_width=96)
     write_video_ffmpeg(rois, output_video_path, ffmpeg_path, audio_path=input_video_path)
     return
@@ -45,7 +47,7 @@ if __name__ == "__main__":
     # and https://github.com/mpc001/Lipreading_using_Temporal_Convolutional_Networks/raw/master/preprocessing/20words_mean_face.npy
 
     parser = argparse.ArgumentParser(description='Preprocess videos by extracting mouth region of interest', formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    parser.add_argument('--video', '-v', type=str, help='path to video dir')
+    parser.add_argument('--video', '-v', type=str, help='path to video dir')    # path to AVSpeech clips dir
     parser.add_argument('--out', '-o', type=str, help='path of output dir')
     parser.add_argument('--predictor', '-p', type=str, help='path to shape predictor 68 face landmarks dat file')
     parser.add_argument('--mean', '-m', type=str, help='path to 20 words mean face npy file')
@@ -58,8 +60,14 @@ if __name__ == "__main__":
 
     ffmpeg_path = "/Users/monicatang/opt/anaconda3/envs/avatar/bin/ffmpeg"
 
-    # TODO: walk through files following the AVSpeech file structure
-    for vid_file in tqdm([f for f in os.listdir(video_dir) if f.endswith(".mp4")]):
-        # TODO: need to filter out videos with multiple faces (and non-English videos?)
-        out_file = os.path.join(out_dir, vid_file)
-        preprocess_video(os.path.join(video_dir, vid_file), out_file, args.predictor, args.mean, ffmpeg_path=ffmpeg_path)
+    # Get video paths from visible subdirectories (ignore hidden dirs)
+    vid_paths = filter(
+        lambda path: not any((part for part in path.parts if part.startswith("."))),
+        Path(video_dir).rglob("*.mp4")
+    )
+    for vid_file in tqdm(vid_paths):
+        vid_file = str(vid_file)
+        vid_filename = os.path.basename(vid_file)
+        out_file = os.path.join(out_dir, vid_filename)
+        if not os.path.exists(out_file):
+            preprocess_video(vid_file, out_file, args.predictor, args.mean, ffmpeg_path=ffmpeg_path)

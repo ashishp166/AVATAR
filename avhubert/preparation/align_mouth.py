@@ -19,6 +19,7 @@ from collections import deque
 import cv2
 from skimage import transform as tf
 from tqdm import tqdm
+from utils import read_video_with_given_fps
 
 # -- Landmark interpolation:
 def linear_interpolate(landmarks, start_idx, stop_idx):
@@ -128,7 +129,7 @@ def load_args(default_config=None):
     return args
 
 
-def crop_patch(video_pathname, landmarks, mean_face_landmarks, stablePntsIDs, STD_SIZE, window_margin, start_idx, stop_idx, crop_height, crop_width):
+def crop_patch(video_pathname, num_frames, landmarks, mean_face_landmarks, stablePntsIDs, STD_SIZE, window_margin, start_idx, stop_idx, crop_height, crop_width):
 
     """Crop mouth patch
     :param str video_pathname: pathname for the video_dieo
@@ -136,8 +137,7 @@ def crop_patch(video_pathname, landmarks, mean_face_landmarks, stablePntsIDs, ST
     """
 
     frame_idx = 0
-    num_frames = get_frame_count(video_pathname)
-    frame_gen = read_video(video_pathname)
+    frame_gen = read_video_with_given_fps(video_pathname)
     margin = min(num_frames, window_margin)
     while True:
         try:

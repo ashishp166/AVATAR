@@ -8,6 +8,7 @@ import cv2
 import torch
 import random
 import numpy as np
+import ffmpeg
 from typing import Dict, List, Optional, Tuple
 
 def load_video(path):
@@ -29,6 +30,53 @@ def load_video(path):
             if i == 2:
                 raise ValueError(f"Unable to load {path}")
 
+def load_video_with_given_fps(path, target_fps=25, pix_fmt='rgb24'):
+    frames = []
+    frame_gen = read_video_with_given_fps(path, target_fps=target_fps, pix_fmt=pix_fmt)
+    while True:
+        try:
+            frame = frame_gen.__next__() ## -- BGR
+            frames.append(frame)
+        except StopIteration:
+            break
+    frames = np.stack(frames)
+    return frames
+
+def read_video_with_given_fps(path, target_fps=25, pix_fmt='rgb24'):
+    for i in range(3):
+        try:
+            probe = ffmpeg.probe(path)
+            video_stream = next((stream for stream in probe['streams'] if stream['codec_type'] == 'video'), None)
+            width = int(video_stream['width'])
+            height = int(video_stream['height'])
+
+            process = (
+                ffmpeg
+                .input(path)
+                .filter('fps', fps=target_fps)
+                .output('pipe:', format='rawvideo', pix_fmt=pix_fmt)
+                .run_async(pipe_stdout=True, quiet=True)
+            )
+
+            while True:
+                if pix_fmt == 'gray':
+                    in_bytes = process.stdout.read(width * height)
+                else:
+                    in_bytes = process.stdout.read(width * height * 3)
+                if not in_bytes:
+                    break
+                if pix_fmt == 'gray':
+                    frame = np.frombuffer(in_bytes, np.uint8).reshape([height, width])
+                else:
+                    frame = np.frombuffer(in_bytes, np.uint8).reshape([height, width, 3])
+                    frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)  # Convert RGB to BGR
+                yield frame
+
+            process.stdout.close()
+        except Exception:
+            print(f"failed loading {path} ({i} / 3)")
+            if i == 2:
+                raise ValueError(f"Unable to load {path}")
 
 class Compose(object):
     """Compose several preprocess together.
