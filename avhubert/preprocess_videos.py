@@ -12,14 +12,16 @@ from itertools import islice
 def detect_landmark(image, detector, predictor):
     rects = detector(image, 1)
     coords = None
+    success = False
     if len(rects) > 1:  # Skip if video has multiple faces
-        return coords, True
+        return coords, success
     for (_, rect) in enumerate(rects):
         shape = predictor(image, rect)
         coords = np.zeros((68, 2), dtype=np.int32)
         for i in range(0, 68):
             coords[i] = (shape.part(i).x, shape.part(i).y)
-    return coords, False
+    success = True
+    return coords, success
 
 def preprocess_video(input_video_path, output_video_path, face_predictor_path, mean_face_path, ffmpeg_path='usr/bin/ffmpeg'):
     detector = dlib.get_frontal_face_detector()
@@ -30,12 +32,14 @@ def preprocess_video(input_video_path, output_video_path, face_predictor_path, m
     frames = load_video_with_given_fps(input_video_path, target_fps=25, pix_fmt='gray')
     landmarks = []
     for frame in tqdm(frames, leave=False):
-        landmark, has_multiple_faces = detect_landmark(frame, detector, predictor)
-        if has_multiple_faces:
-            print(f"Skip {input_video_path}")
+        landmark, success = detect_landmark(frame, detector, predictor)
+        if not success:
+            tqdm.write(f"Skip {input_video_path}")
             return
         landmarks.append(landmark)
     preprocessed_landmarks = landmarks_interpolate(landmarks)
+    if not preprocessed_landmarks:
+        return
     rois = crop_patch(input_video_path, len(frames), preprocessed_landmarks, mean_face_landmarks, stablePntsIDs, STD_SIZE, 
                             window_margin=12, start_idx=48, stop_idx=68, crop_height=96, crop_width=96)
     write_video_ffmpeg(rois, output_video_path, ffmpeg_path, audio_path=input_video_path)
@@ -61,11 +65,11 @@ if __name__ == "__main__":
     ffmpeg_path = "/Users/monicatang/opt/anaconda3/envs/avatar/bin/ffmpeg"
 
     # Get video paths from visible subdirectories (ignore hidden dirs)
-    vid_paths = filter(
+    vid_paths = list(filter(
         lambda path: not any((part for part in path.parts if part.startswith("."))),
         Path(video_dir).rglob("*.mp4")
-    )
-    for vid_file in tqdm(vid_paths):
+    ))
+    for vid_file in tqdm(vid_paths, total=len(vid_paths)):
         vid_file = str(vid_file)
         vid_filename = os.path.basename(vid_file)
         out_file = os.path.join(out_dir, vid_filename)
