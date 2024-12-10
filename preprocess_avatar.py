@@ -24,12 +24,12 @@ class AvatarDataPreprocessor():
     def __init__(self, video_data_dir, noise_data_dir, avhubert_path=None, preprocess_dir="preprocessed_data", chunk_size=3000):
         self.video_data_dir = Path(video_data_dir)
         self.noise_data_dir = Path(noise_data_dir)
-        self.snr_values = [-10, -5, -3, 0, 3, 5]  # Variety of SNR values
+        self.snr_range = [-5, 10]  # Variety of SNR values
         self.preprocess_dir = Path(preprocess_dir)
         self.chunk_size = chunk_size
         self.video_files = sorted(self.video_data_dir.glob('*.mp4'))
         self.noise_files = sorted(self.noise_data_dir.glob('*.wav'))
-        self.embedding_extractor = self._default_embedding_extractor(avhubert_path)
+        self.embedding_extractor, self.sparc_encoder = self._default_embedding_extractor(avhubert_path)
         self.stack_order_audio = 4  # Used for audio feature stacking
         self.preprocess_dir.mkdir(parents=True, exist_ok=True)  # Ensure the directory exists
         self._preprocess_data()
@@ -41,26 +41,67 @@ class AvatarDataPreprocessor():
         model = av_hubert_models[0]
         model.eval()
         self.model = model
+        sparc_encoder = load_model("multi", device="cpu", use_penn=False, ft_sr=25)
 
-        def extract_embeddings(video_frames, noisy_audio_feat):
+        def extract_embeddings(video_frames: torch.Tensor, noisy_audio_feat: torch.Tensor, noisy_wav: torch.Tensor, clean_wav: torch.Tensor):
+            """
+            Extract AV-HuBERT embeddings, and concatenate EMA, loudness, and pitch values from the sparc_encoder.
+            
+            Args:
+            - video_frames (torch.Tensor): Video frames tensor.
+            - noisy_audio_feat (torch.Tensor): Audio features tensor.
+            - noisy_wav (torch.Tensor): Noisy waveform tensor.
+            - clean_wav (torch.Tensor): Clean waveform tensor.
+            
+            Returns:
+            - av_embeddings (np.ndarray): AV-HuBERT embeddings.
+            - noisy_features (np.ndarray): Concatenated noisy EMA, loudness, and pitch.
+            - clean_features (np.ndarray): Concatenated clean EMA, loudness, and pitch.
+            """
             with torch.no_grad():
-                video_frames = video_frames.unsqueeze(0).unsqueeze(0)
-                noisy_audio_feat = noisy_audio_feat.unsqueeze(0).permute(0, 2, 1)
+                video_frames = video_frames.unsqueeze(0).unsqueeze(0)  # [1, 1, T, H, W]
+                noisy_audio_feat = noisy_audio_feat.unsqueeze(0).permute(0, 2, 1)  # [1, F, T]
+                
                 outputs = self.model(source={'video': video_frames, 'audio': noisy_audio_feat}, features_only=True)
-                return outputs["features"].squeeze().numpy()
+                av_embeddings = outputs["features"].squeeze().numpy()  # [T, D]
 
-        return extract_embeddings
+
+                noisy_encoding = sparc_encoder.encode(noisy_wav.numpy().flatten())
+                noisy_ema = np.concatenate(
+                    [noisy_encoding['ema'],  # [L, 12]
+                    noisy_encoding['loudness'],  # [L, 1]
+                    noisy_encoding['pitch']],  # [L, 1]
+                    axis=-1
+                ) 
+
+                clean_encoding = sparc_encoder.encode(clean_wav.numpy().flatten())
+                clean_ema = np.concatenate(
+                    [clean_encoding['ema'],  # [L, 12]
+                    clean_encoding['loudness'],  # [L, 1]
+                    clean_encoding['pitch']],  # [L, 1]
+                    axis=-1
+                )
+
+            return av_embeddings, noisy_ema, clean_ema
+        return extract_embeddings, sparc_encoder
 
     def _augment_with_noise(self, speech, noise):
         clean_len = speech.shape[-1]
         noise_len = noise.shape[-1]
+
+        # Select a random segment of the noise if noise is longer than the speech
         if clean_len < noise_len:
-            noise = noise[:, :clean_len]
+            start_idx = random.randint(0, noise_len - clean_len)
+            noise = noise[:, start_idx:start_idx + clean_len]
         elif clean_len > noise_len:
             noise = noise.repeat(1, (clean_len // noise_len) + 1)[:, :clean_len]
+
+        # Apply a Tukey window to smooth transitions in the noise
         tukey = torch.from_numpy(windows.tukey(clean_len)).unsqueeze(0).to(noise.device)
         noise = noise * tukey
-        snr = random.choice(self.snr_values)  # Randomly choose an SNR value
+
+        # Randomly select an SNR level and add noise to the speech
+        snr = random.uniform(*self.snr_range)
         noisy_speech = torchaudio.functional.add_noise(speech, noise, torch.Tensor([snr]))
         return noisy_speech
 
@@ -79,7 +120,9 @@ class AvatarDataPreprocessor():
             chunk_start = chunk_idx * self.chunk_size
             chunk_end = min((chunk_idx + 1) * self.chunk_size, len(self.video_files))
             chunk_video_files = self.video_files[chunk_start:chunk_end]
-            embeddings = []
+            avhubert_embeddings = []
+            noisy_ema_values = []
+            clean_ema_values = []
 
             logger.info(f"Processing chunk {chunk_idx + 1}/{num_chunks} (files {chunk_start} to {chunk_end})")
             for video_file in chunk_video_files:
@@ -99,15 +142,19 @@ class AvatarDataPreprocessor():
                     noisy_audio_feats = noisy_audio_feats[:len(video_frames)]
                 elif len(video_frames) > len(noisy_audio_feats):
                     video_frames = video_frames[:len(noisy_audio_feats)]
-                embeddings.append(self.embedding_extractor(video_frames, noisy_audio_feats))
+
+                av_embeddings, noisy_ema, clean_ema = self.embedding_extractor(video_frames, noisy_audio_feats, noisy_wav, clean_wav)
+                avhubert_embeddings.append(av_embeddings)
+                noisy_ema_values.append(noisy_ema)
+                clean_ema_values.append(clean_ema)
 
             chunk_file = self.preprocess_dir / f"preprocessed_data_chunk_{chunk_idx + 1}.pkl"
-            joblib.dump(embeddings, chunk_file)
+            joblib.dump((avhubert_embeddings, noisy_ema_values, clean_ema_values), chunk_file)
             logger.info(f"Chunk {chunk_idx + 1} saved to {chunk_file}")
 
 if __name__ == "__main__":
-    avhubert_path = "./avhubert/data/base_lrs3_iter5.pt" 
+    avhubert_path = "./avhubert/data/base_lrs3_iter5.pt"
     video_dir = "./avhubert/xaa_cropped_mouths"
     noise_dir = "./avhubert/data/train_data/noise"
     preprocess_dir = "./avhubert/data/preprocessed_chunks"
-    preprocessor = AvatarDataPreprocessor(video_dir, noise_dir, avhubert_path=avhubert_path, preprocess_dir=preprocess_dir, chunk_size=3000)
+    preprocessor = AvatarDataPreprocessor(video_dir, noise_dir, avhubert_path=avhubert_path, preprocess_dir=preprocess_dir, chunk_size=30)
