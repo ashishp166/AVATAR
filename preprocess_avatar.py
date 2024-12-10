@@ -12,6 +12,7 @@ from fairseq.checkpoint_utils import load_model_ensemble_and_task
 from python_speech_features import logfbank
 import joblib
 import logging
+from concurrent.futures import ThreadPoolExecutor
 from scipy.signal import resample, windows
 
 logging.basicConfig(level=logging.INFO, 
@@ -34,7 +35,7 @@ class AvatarDataPreprocessor():
         self.preprocess_dir.mkdir(parents=True, exist_ok=True)  # Ensure the directory exists
         self._preprocess_data()
     
-    def get_ema_embedding(self, audio_arr: np.array):
+    def get_ema_embedding(self, audio_arr_batch: np.array):
             """
             Process audio array to extract EMA embedding along with loudness and pitch in batched format for parallelization
 
@@ -44,10 +45,9 @@ class AvatarDataPreprocessor():
             Returns:
             - np.ndarray: Concatenated EMA, loudness, and pitch values.
             """
-            encodings = self.sparc_encoder.encode(audio_arr)
-            ema_batch = []
+            encodings = self.sparc_encoder.encode(audio_arr_batch)  # Batched processing
 
-            for encoding in encodings:  # Iterate over batch elements
+            def process_encoding(encoding):
                 loudness = resample(encoding['loudness'], encoding['loudness'].shape[0] * 2)[:encoding['ema'].shape[0]]
                 pitch = resample(encoding['pitch'], encoding['pitch'].shape[0] * 2)[:encoding['ema'].shape[0]]
                 ema = np.concatenate(
@@ -58,9 +58,13 @@ class AvatarDataPreprocessor():
                     ],
                     axis=-1
                 )
-                ema_batch.append(ema)
+                return ema
+
+            with ThreadPoolExecutor() as executor:
+                ema_batch = list(executor.map(process_encoding, encodings))
 
             return ema_batch
+    
     def _default_embedding_extractor(self, avhubert_path):
         if not avhubert_path:
             raise ValueError("Provide the path to an AVHubert checkpoint")
