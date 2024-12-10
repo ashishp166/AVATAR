@@ -26,14 +26,21 @@ import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader, random_split
 import numpy as np
+from tqdm import tqdm
+import matplotlib.pyplot as plt
+import warnings
 
 
+logging.config.dictConfig({
+    'version': 1,
+    'disable_existing_loggers': True,
+})
 logging.basicConfig(level=logging.INFO, 
                     format='%(asctime)s - %(levelname)s: %(message)s',
                     datefmt='%Y-%m-%d %H:%M:%S')
 logger = logging.getLogger(__name__)
-logging.getLogger('numba').setLevel(logging.WARNING)
-logging.getLogger("urllib3").setLevel(logging.WARNING)
+
+warnings.filterwarnings("ignore")
 
 import joblib
 
@@ -57,7 +64,7 @@ class AvatarDATASET(Dataset):
         return self.X[idx], self.y[idx]
     
 class AvatarDataPreprocessor():
-    def __init__(self, video_data_dir, noise_data_dir, snr=3, embedding_extractor=None, limit_files=None, preprocess_file="preprocessed_avatar_data.pkl", avhubert_path=None):
+    def __init__(self, video_data_dir, noise_data_dir, snr_range=[-5, 5], embedding_extractor=None, limit_files=None, preprocess_file="preprocessed_avatar_data.pkl", avhubert_path=None, random_seed=42):
         self.video_data_dir = Path(video_data_dir)
         self.noise_data_dir = Path(noise_data_dir)
         self.preprocess_file = preprocess_file
@@ -70,8 +77,8 @@ class AvatarDataPreprocessor():
         
         # https://github.com/facebookresearch/av_hubert/issues/85#issuecomment-1836827405
         self.stack_order_audio = 4
-        self.snr = snr
-
+        self.snr_range = snr_range
+        self.random_seed = random_seed
         self.embedding_extractor = embedding_extractor or self._default_embedding_extractor(avhubert_path)
         
         # Precompute and preprocess data, or load if cached
@@ -105,8 +112,9 @@ class AvatarDataPreprocessor():
         clean_len = speech.shape[-1]
         noise_len = noise.shape[-1]
         if clean_len < noise_len:
-            # TODO: could also get a random segment of the noise
-            noise = noise[:, :clean_len]
+            # Get a random segment of the noise
+            random_i = random.randint(0, noise_len - clean_len - 1)
+            noise = noise[:, random_i : random_i + clean_len]
         elif clean_len > noise_len:
             n_loops = clean_len // noise_len + 1
             # Apply Tukey window to avoid popping
@@ -149,7 +157,8 @@ class AvatarDataPreprocessor():
                 feats = feats.reshape((-1, stack_order, feat_dim)).reshape(-1, stack_order*feat_dim)
                 return feats
             
-            for video_file in self.video_files:
+            random.seed(self.random_seed)
+            for video_file in tqdm(self.video_files, total=len(self.video_files)):
                 # Load video and wav
                 video_file = str(video_file)
                 noise_file = str(random.choice(self.noise_files))
@@ -165,7 +174,8 @@ class AvatarDataPreprocessor():
                     waveform = resampler(waveform)
 
                 # Get audio features for AVHubert
-                noisy_speech_wav = self._augment_with_noise(clean_wav, noise_wav, self.snr)
+                snr = random.uniform(*self.snr_range)
+                noisy_speech_wav = self._augment_with_noise(clean_wav, noise_wav, snr)
                 noisy_audio_feats = logfbank(noisy_speech_wav, samplerate=SAMPLE_RATE).astype(np.float32) # [T, F]
                 noisy_audio_feats = _stacker(noisy_audio_feats, self.stack_order_audio) # [T/stack_order_audio, F*stack_order_audio]
                 noisy_audio_feats = torch.from_numpy(noisy_audio_feats.astype(np.float32))
@@ -426,8 +436,8 @@ def main():
     avhubert_path = "./avhubert/data/base_lrs3_iter5.pt"
     vid_dir = "./avhubert/data/video"
     noise_dir = "./avhubert/data/noise"
-    snr = 3
-    preprocessor = AvatarDataPreprocessor(vid_dir, noise_dir, snr=snr, avhubert_path=avhubert_path)
+    snr_range = [-5, 5]
+    preprocessor = AvatarDataPreprocessor(vid_dir, noise_dir, snr_range=snr_range, avhubert_path=avhubert_path)
 
     avhubert_embedding, noisy_ema_embedding, clean_ema_embedding = load_and_analyze_data()
     avatar_embedding = concatenate_embeddings(avhubert_embedding, noisy_ema_embedding)
@@ -441,6 +451,20 @@ def main():
     trained_model, train_losses, val_losses = train_and_evaluate(
         model, train_loader, val_loader, test_loader
     )
+    
+    # Save as pt and save loss plots
+    torch.save(model.state_dict(), f"./model.pt")
+    joblib.dump((train_losses, val_losses), f"./train_val_losses.pkl")
+
+    plt.plot(train_losses, label='Training Loss')
+    plt.plot(val_losses, label='Validation Loss')
+    plt.xlabel('Epoch')
+    plt.ylabel('Loss')
+    plt.title(f'Training and Validation Loss')
+    plt.legend()
+    plt.savefig(f"train_val_loss_plot.png")
+    plt.show()
+
     return trained_model, train_losses, val_losses
 
 if __name__ == "__main__":
