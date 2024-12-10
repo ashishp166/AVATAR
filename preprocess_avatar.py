@@ -43,6 +43,18 @@ class AvatarDataPreprocessor():
         self.model = model
         sparc_encoder = load_model("multi", device="cpu", use_penn=False, ft_sr=25)
 
+        def get_ema_embedding(audio_arr: np.array):
+            encoding = sparc_encoder.encode(audio_arr)
+            loudness = resample(encoding['loudness'], encoding['loudness'].shape[0]*2)[:encoding['ema'].shape[0]]
+            pitch = resample(encoding['pitch'], encoding['pitch'].shape[0]*2)[:encoding['ema'].shape[0]]
+            ema = np.concatenate(
+                [encoding['ema'],  # [L, 12]
+                loudness,  # [L, 1]
+                pitch],  # [L, 1]
+                axis=-1
+            ) 
+            return ema
+        
         def extract_embeddings(video_frames: torch.Tensor, noisy_audio_feat: torch.Tensor, noisy_wav: torch.Tensor, clean_wav: torch.Tensor):
             """
             Extract AV-HuBERT embeddings, and concatenate EMA, loudness, and pitch values from the sparc_encoder.
@@ -66,21 +78,8 @@ class AvatarDataPreprocessor():
                 av_embeddings = outputs["features"].squeeze().numpy()  # [T, D]
 
 
-                noisy_encoding = sparc_encoder.encode(noisy_wav.numpy().flatten())
-                noisy_ema = np.concatenate(
-                    [noisy_encoding['ema'],  # [L, 12]
-                    noisy_encoding['loudness'],  # [L, 1]
-                    noisy_encoding['pitch']],  # [L, 1]
-                    axis=-1
-                ) 
-
-                clean_encoding = sparc_encoder.encode(clean_wav.numpy().flatten())
-                clean_ema = np.concatenate(
-                    [clean_encoding['ema'],  # [L, 12]
-                    clean_encoding['loudness'],  # [L, 1]
-                    clean_encoding['pitch']],  # [L, 1]
-                    axis=-1
-                )
+                noisy_ema = get_ema_embedding(noisy_wav.numpy().flatten())
+                clean_ema = get_ema_embedding(clean_wav.numpy().flatten())
 
             return av_embeddings, noisy_ema, clean_ema
         return extract_embeddings, sparc_encoder
@@ -157,4 +156,4 @@ if __name__ == "__main__":
     video_dir = "./avhubert/xaa_cropped_mouths"
     noise_dir = "./avhubert/data/train_data/noise"
     preprocess_dir = "./avhubert/data/preprocessed_chunks"
-    preprocessor = AvatarDataPreprocessor(video_dir, noise_dir, avhubert_path=avhubert_path, preprocess_dir=preprocess_dir, chunk_size=30)
+    preprocessor = AvatarDataPreprocessor(video_dir, noise_dir, avhubert_path=avhubert_path, preprocess_dir=preprocess_dir, chunk_size=3)
