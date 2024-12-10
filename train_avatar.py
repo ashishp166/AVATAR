@@ -228,12 +228,12 @@ def load_and_analyze_data(preprocess_file='preprocessed_avatar_data.pkl'):
 
 class EMAReconstructionModel(nn.Module):
     def __init__(self, 
-                 input_dim=780,  # Combined embedding (768 + 12)
+                 input_dim=782,  # Combined embedding (768 + 14)
                  embedding_dim=768, 
-                 ema_dim=12, 
+                 ema_dim=14, 
                  hidden_dim=128, 
-                 mask_prob_embedding=0.1, 
-                 mask_prob_ema=0.2):
+                 mask_prob_embedding=0.25, 
+                 mask_prob_ema=0.4):
         """
         Neural network for EMA value reconstruction with masking and bidirectional LSTM
         
@@ -263,6 +263,7 @@ class EMAReconstructionModel(nn.Module):
         self.output_layer = nn.Linear(hidden_dim * 2, ema_dim)
         self.relu = nn.ReLU()
         self.mse_loss = nn.MSELoss()
+        self.dropout = nn.Dropout(0.3)
     
     def mask_features(self, x, mask_prob_embedding, mask_prob_ema):
         """
@@ -295,20 +296,26 @@ class EMAReconstructionModel(nn.Module):
         Returns:
         Reconstructed EMA values
         """
-        if self.training or target is not None:
+        if self.training and target is not None:
             x = self.mask_features(x, self.mask_prob_embedding, self.mask_prob_ema)
         
         x = self.input_projection(x)
         x = self.relu(x)
+
+        if self.training:
+            x = self.dropout(x)
         
-        # Bidirectional LSTM
         lstm_out, _ = self.bidirectional_lstm(x)
+        
+        if self.training:
+            x = self.dropout(x)
         
         reconstructed_ema = self.output_layer(lstm_out)
         
         if target is not None:
             loss = self.mse_loss(reconstructed_ema, target)
             return loss
+        
         return reconstructed_ema
 
 def concatenate_embeddings(avhubert_embedding, ema_data):
@@ -319,10 +326,10 @@ def concatenate_embeddings(avhubert_embedding, ema_data):
     X (numpy.ndarray): Input embeddings with shape (num_samples, time_steps, embedding_dim)
                        In your case, X has shape (num_samples, 293, 768)
     y (numpy.ndarray): Target values with shape (num_samples, time_steps, target_dim)
-                       In your case, y has shape (num_samples, 293, 12)
+                       In your case, y has shape (num_samples, 293, 14)
     
     Returns:
-    numpy.ndarray: Concatenated embeddings with shape (num_samples, 293, 780)
+    numpy.ndarray: Concatenated embeddings with shape (num_samples, 293, 782)
     """
     assert avhubert_embedding.shape[0] == ema_data.shape[0], "Number of timesteps must match"
     avatar_embedding = np.concatenate([avhubert_embedding, ema_data], axis=-1)
@@ -388,13 +395,13 @@ def train_and_evaluate(model, train_loader, val_loader, test_loader,
     Returns:
     Trained model with training history
     """
-    optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
+    optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate, weight_decay=1e-5) # weigth decay for regularization
     
     train_losses = []
     val_losses = []
     
     for epoch in range(num_epochs):
-        model.train()
+        model.train() # sets self.training to true
         epoch_train_loss = 0
         for X_batch, y_batch in train_loader:
             optimizer.zero_grad()
@@ -406,12 +413,13 @@ def train_and_evaluate(model, train_loader, val_loader, test_loader,
         avg_train_loss = epoch_train_loss / len(train_loader)
         train_losses.append(avg_train_loss)
         
-        model.eval()
+        model.eval() # sets self.training to false
         epoch_val_loss = 0
         with torch.no_grad():
             for X_batch, y_batch in val_loader:
-                val_loss = model(X_batch, y_batch)
-                epoch_val_loss += val_loss.item()
+                predictions = model(X_batch)
+                batch_loss = nn.functional.mse_loss(predictions, y_batch)
+                epoch_val_loss += batch_loss.item()
         avg_val_loss = epoch_val_loss / len(val_loader)
         val_losses.append(avg_val_loss)
         if epoch % 10 == 0:
@@ -424,7 +432,8 @@ def train_and_evaluate(model, train_loader, val_loader, test_loader,
     test_loss = 0
     with torch.no_grad():
         for X_batch, y_batch in test_loader:
-            batch_loss = model(X_batch, y_batch)
+            predictions = model(X_batch)
+            batch_loss = nn.functional.mse_loss(predictions, y_batch)
             test_loss += batch_loss.item()
     
     avg_test_loss = test_loss / len(test_loader)
@@ -436,7 +445,7 @@ def main():
     avhubert_path = "./avhubert/data/base_lrs3_iter5.pt"
     vid_dir = "./avhubert/data/video"
     noise_dir = "./avhubert/data/noise"
-    snr_range = [-5, 5]
+    snr_range = [-5, 10]
     preprocessor = AvatarDataPreprocessor(vid_dir, noise_dir, snr_range=snr_range, avhubert_path=avhubert_path)
 
     avhubert_embedding, noisy_ema_embedding, clean_ema_embedding = load_and_analyze_data()
