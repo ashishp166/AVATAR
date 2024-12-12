@@ -25,11 +25,21 @@ def video_length_seconds(filename):
         print(filename)
         raise ValueError(result.stderr.rstrip("\n"))
 
-# all mp4 files in the directory and all its subdirectories
-dir = "/Users/monicatang/Downloads/AVSpeech/clips/"
-vids = filter(
-    lambda path: not any((part for part in path.parts if part.startswith("."))),
-    Path(dir).rglob("*.mp4")
-)
-len_seconds = sum(video_length_seconds(f) for f in tqdm(vids))
-print(datetime.timedelta(seconds=len_seconds))
+if __name__ == "__main__":
+    # Get total duration of all files in the directory and its subdirectories
+    
+    # # Video
+    # dir = "/Users/monicatang/Downloads/AVSpeech/clips/"
+    # dir = "/Users/monicatang/Desktop/ee225d/av_dataset"
+    # filetype = "mp4"
+
+    # Audio
+    dir = "/Users/monicatang/Downloads/musan/noise/wavfiles"
+    filetype = "wav"
+
+    vids = list(filter(
+        lambda path: not any((part for part in path.parts if part.startswith("."))),
+        Path(dir).rglob(f"*.{filetype}")
+    ))
+    len_seconds = sum(video_length_seconds(f) for f in tqdm(vids, total=len(vids)))
+    print(datetime.timedelta(seconds=len_seconds))
