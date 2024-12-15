@@ -75,43 +75,36 @@ def load_and_analyze_data(preprocess_file='preprocessed_avatar_data.pkl'):
     return avhubert_embedding, noisy_ema_data, clean_ema_data
 
 class EMAReconstructionModel(nn.Module):
-    def __init__(self, 
-                 input_dim=782,  # Combined embedding (768 + 14)
-                 embedding_dim=768, 
-                 ema_dim=14, 
-                 hidden_dim=128, 
-                 mask_prob_embedding=0.25, 
-                 mask_prob_ema=0.4):
-        """
-        Neural network for EMA value reconstruction with masking and bidirectional LSTM
-        
-        Parameters:
-        - input_dim: Total combined feature dimension
-        - embedding_dim: Dimension of original embedding
-        - ema_dim: Dimension of EMA values
-        - hidden_dim: Hidden dimension for LSTM
-        - mask_prob_embedding: Probability of masking embedding features
-        - mask_prob_ema: Probability of masking EMA features
-        """
+    def __init__(self, input_dim=782, embedding_dim=768, ema_dim=14, hidden_dim=256, 
+                mask_prob_embedding=0.25, mask_prob_ema=0.4):
         super(EMAReconstructionModel, self).__init__()
         self.mask_prob_embedding = mask_prob_embedding
         self.mask_prob_ema = mask_prob_ema
         self.embedding_dim = embedding_dim
         self.ema_dim = ema_dim
+
         self.input_projection = nn.Linear(input_dim, hidden_dim)
+        self.input_layernorm = nn.LayerNorm(hidden_dim)
+
         self.bidirectional_lstm = nn.LSTM(
-            input_size=hidden_dim, 
-            hidden_size=hidden_dim, 
-            bidirectional=True, 
-            batch_first=True
+            input_size=hidden_dim, hidden_size=hidden_dim, num_layers=3, 
+            bidirectional=True, batch_first=True, dropout=0.05
         )
         
-        # Output reconstruction layer
-        # Note: bidirectional LSTM doubles the input dimension
-        self.output_layer = nn.Linear(hidden_dim * 2, ema_dim)
+        self.output_layer = nn.Sequential(
+            nn.Linear(hidden_dim * 2, hidden_dim),
+            nn.GLU(),
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.GLU(),
+            nn.Linear(hidden_dim // 2, ema_dim)
+        )
+        
+        self.mask_embedding_token = nn.Parameter(torch.zeros(self.embedding_dim))
+        self.mask_ema_token = nn.Parameter(torch.zeros(self.ema_dim))
         self.relu = nn.ReLU()
-        self.mse_loss = nn.MSELoss()
-        self.dropout = nn.Dropout(0.3)
+        self.loss_fn = nn.SmoothL1Loss()
+        self.dropout = nn.Dropout(0.1)
+
     
     def mask_features(self, x, mask_prob_embedding, mask_prob_ema):
         """
@@ -135,33 +128,25 @@ class EMAReconstructionModel(nn.Module):
         return x_masked
         
     def forward(self, x, target=None):
-        """
-        Forward pass through the network
-        
-        Args:
-        - x (torch.Tensor): Input tensor of shape (batch_size, time_steps, input_dim)
-        
-        Returns:
-        Reconstructed EMA values
-        """
         if self.training and target is not None:
             x = self.mask_features(x, self.mask_prob_embedding, self.mask_prob_ema)
         
         x = self.input_projection(x)
+        x = self.input_layernorm(x)
         x = self.relu(x)
-
         if self.training:
             x = self.dropout(x)
         
-        lstm_out, _ = self.bidirectional_lstm(x)
+        x_lstm, _ = self.bidirectional_lstm(x)
+        x = x + x_lstm  # Residual connection
         
         if self.training:
             x = self.dropout(x)
         
-        reconstructed_ema = self.output_layer(lstm_out)
+        reconstructed_ema = self.output_layer(x)
         
         if target is not None:
-            loss = self.mse_loss(reconstructed_ema, target)
+            loss = self.loss_fn(reconstructed_ema, target)
             return loss
         
         return reconstructed_ema
@@ -244,7 +229,7 @@ def train_and_evaluate(model, train_loader, val_loader, test_loader,
     Trained model with training history
     """
     optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate, weight_decay=1e-5) # weigth decay for regularization
-    
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.1, patience=5)
     train_losses = []
     val_losses = []
     
@@ -255,6 +240,7 @@ def train_and_evaluate(model, train_loader, val_loader, test_loader,
             optimizer.zero_grad()
             loss = model(X_batch, y_batch)
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
             epoch_train_loss += loss.item()
         
@@ -266,10 +252,11 @@ def train_and_evaluate(model, train_loader, val_loader, test_loader,
         with torch.no_grad():
             for X_batch, y_batch in val_loader:
                 predictions = model(X_batch)
-                batch_loss = nn.functional.mse_loss(predictions, y_batch)
+                batch_loss = nn.SmoothL1Loss(predictions, y_batch)
                 epoch_val_loss += batch_loss.item()
         avg_val_loss = epoch_val_loss / len(val_loader)
         val_losses.append(avg_val_loss)
+        scheduler.step(avg_val_loss)
         if epoch % 10 == 0:
             print(f"Epoch {epoch}:")
             print(f"  Train Loss: {avg_train_loss:.4f}")
@@ -281,7 +268,7 @@ def train_and_evaluate(model, train_loader, val_loader, test_loader,
     with torch.no_grad():
         for X_batch, y_batch in test_loader:
             predictions = model(X_batch)
-            batch_loss = nn.functional.mse_loss(predictions, y_batch)
+            batch_loss = nn.SmoothL1Loss(predictions, y_batch)
             test_loss += batch_loss.item()
     
     avg_test_loss = test_loss / len(test_loader)
