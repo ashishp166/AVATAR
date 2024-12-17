@@ -94,9 +94,9 @@ class EMAReconstructionModel(nn.Module):
         self.output_layer = nn.Sequential(
             nn.Linear(hidden_dim * 2, hidden_dim),
             nn.GLU(),
-            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.Linear(hidden_dim // 2, hidden_dim // 4),
             nn.GLU(),
-            nn.Linear(hidden_dim // 2, ema_dim)
+            nn.Linear(hidden_dim // 8, ema_dim)
         )
         
         self.mask_embedding_token = nn.Parameter(torch.zeros(self.embedding_dim))
@@ -138,6 +138,7 @@ class EMAReconstructionModel(nn.Module):
             x = self.dropout(x)
         
         x_lstm, _ = self.bidirectional_lstm(x)
+        x = torch.tile(x, dims=(1, 2))
         x = x + x_lstm  # Residual connection
         
         if self.training:
@@ -252,7 +253,7 @@ def train_and_evaluate(model, train_loader, val_loader, test_loader,
         with torch.no_grad():
             for X_batch, y_batch in val_loader:
                 predictions = model(X_batch)
-                batch_loss = nn.SmoothL1Loss(predictions, y_batch)
+                batch_loss = nn.functional.smooth_l1_loss(predictions, y_batch)
                 epoch_val_loss += batch_loss.item()
         avg_val_loss = epoch_val_loss / len(val_loader)
         val_losses.append(avg_val_loss)
@@ -268,7 +269,7 @@ def train_and_evaluate(model, train_loader, val_loader, test_loader,
     with torch.no_grad():
         for X_batch, y_batch in test_loader:
             predictions = model(X_batch)
-            batch_loss = nn.SmoothL1Loss(predictions, y_batch)
+            batch_loss = nn.functional.smooth_l1_loss(predictions, y_batch)
             test_loss += batch_loss.item()
     
     avg_test_loss = test_loss / len(test_loader)
@@ -277,7 +278,7 @@ def train_and_evaluate(model, train_loader, val_loader, test_loader,
     return model, train_losses, val_losses
 
 def main():
-    pkl_path = "./avhubert/data/preprocessed_av_ema/xaa_0.pkl"
+    pkl_path = "./avhubert/data/preprocessed_av_ema/preprocessed_data_combined.pkl"
     avhubert_embedding, noisy_ema_embedding, clean_ema_embedding = load_and_analyze_data(preprocess_file=pkl_path)
     avatar_embedding = concatenate_embeddings(avhubert_embedding, noisy_ema_embedding)
     avatar_embedding_train, avatar_embedding_val, avatar_embedding_test, clean_ema_train, clean_ema_val, clean_ema_test = split_data(avatar_embedding, clean_ema_embedding)
@@ -292,8 +293,10 @@ def main():
     )
     
     # Save as pt and save loss plots
-    torch.save(model.state_dict(), f"./model.pt")
-    joblib.dump((train_losses, val_losses), f"./train_val_losses.pkl")
+    save_dir = "./results"
+    os.makedirs(save_dir, exist_ok=True)
+    torch.save(model.state_dict(), os.path.join(save_dir, "./ema_recon_model.pt"))
+    joblib.dump((train_losses, val_losses), os.path.join(save_dir, "./train_val_losses.pkl"))
 
     plt.plot(train_losses, label='Training Loss')
     plt.plot(val_losses, label='Validation Loss')
@@ -301,7 +304,7 @@ def main():
     plt.ylabel('Loss')
     plt.title(f'Training and Validation Loss')
     plt.legend()
-    plt.savefig(f"train_val_loss_plot.png")
+    plt.savefig(os.path.join(save_dir, "train_val_loss_plot.png"))
     plt.show()
 
     return trained_model, train_losses, val_losses
